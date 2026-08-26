@@ -51,13 +51,24 @@
   };
 
   async function init(){
+    injectStyles();
+    install(); // Always install the navigation hooks. Auth/data are resolved when used.
     if(new URLSearchParams(location.search).get('demo')==='1'){installDemoWarning();return;}
-    if(cfg.mode!=='production'||!cfg.supabaseUrl||!cfg.supabaseAnonKey||!window.supabase)return;
+    if(cfg.mode!=='production'||!cfg.supabaseUrl||!cfg.supabaseAnonKey||!window.supabase){
+      console.warn('BME tracker manager: Supabase production configuration is unavailable.');
+      return;
+    }
     sb=window.supabase.createClient(cfg.supabaseUrl,cfg.supabaseAnonKey,{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true}});
-    ({data:{session}}=await sb.auth.getSession());
-    if(!session)return;
-    await loadData(); install();
-    sb.auth.onAuthStateChange(async(_e,s)=>{session=s;if(s){await loadData();install();}});
+    // Register the listener BEFORE checking the current session so an auth event cannot be missed.
+    sb.auth.onAuthStateChange(async(_e,s)=>{
+      session=s||null;
+      if(session){await loadData();install();}
+      else {profile=null;}
+    });
+    const auth=await sb.auth.getSession();
+    if(auth.error) console.warn('BME tracker manager auth check failed:',auth.error.message);
+    session=auth.data?.session||null;
+    if(session){await loadData();install();}
   }
 
   function installDemoWarning(){
@@ -88,20 +99,30 @@
   }
 
   function install(){
-    if(!profile)return; injectStyles(); injectButtons();
-    observer?.disconnect(); observer=new MutationObserver(injectButtons);
+    injectStyles(); injectButtons();
+    observer?.disconnect(); observer=new MutationObserver(()=>injectButtons());
     const app=document.getElementById('app');if(app)observer.observe(app,{subtree:true,childList:true});
+    // The main app can replace the sidebar after async authentication/rendering.
+    // A light retry makes the controls deterministic even if MutationObserver misses that transition.
+    if(!window.__bmeTrackerNavRetry){
+      window.__bmeTrackerNavRetry=setInterval(injectButtons,1200);
+    }
   }
 
   function injectButtons(){
-    const nav=document.querySelector('.nav'); if(!nav||nav.querySelector('[data-tracker-manager]'))return;
+    const nav=document.querySelector('.nav'); if(!nav)return;
     const logout=nav.querySelector('#logoutBtn');
-    [['ct','CT+','Manage CTs'],['sessional','SL','Sessional Setup']].forEach(([k,i,l])=>{
-      const b=document.createElement('button');b.dataset.trackerManager=k;b.innerHTML=`<span>${i}</span>${l}`;b.onclick=()=>openManager(k);nav.insertBefore(b,logout);
-    });
-    if(isAdmin()){
-      const b=document.createElement('button');b.dataset.trackerManager='health';b.innerHTML='<span>DB</span>Sync Health';b.onclick=()=>openManager('health');nav.insertBefore(b,logout);
-    }
+    const ensureButton=(k,i,l)=>{
+      if(nav.querySelector(`[data-tracker-manager="${k}"]`))return;
+      const b=document.createElement('button');
+      b.dataset.trackerManager=k;
+      b.innerHTML=`<span>${i}</span>${l}`;
+      b.onclick=()=>openManager(k);
+      if(logout)nav.insertBefore(b,logout);else nav.appendChild(b);
+    };
+    ensureButton('ct','CT+','Manage CTs');
+    ensureButton('sessional','SL','Sessional Setup');
+    if(isAdmin())ensureButton('health','DB','Sync Health');
   }
 
   function canManage(c){
@@ -116,7 +137,28 @@
     document.body.appendChild(root);document.getElementById('trackerAdminClose').onclick=closeModal;root.onclick=e=>{if(e.target===root)closeModal();};
   }
   function closeModal(){document.getElementById('trackerAdminRoot')?.remove();}
-  async function openManager(kind){await loadData();if(kind==='ct')renderCtManager();if(kind==='sessional')renderSessionalManager();if(kind==='health')renderHealth();}
+  async function ensureReady(){
+    if(new URLSearchParams(location.search).get('demo')==='1'){
+      toast('Demo mode is read-only for this manager. Remove ?demo=1 for Supabase updates.','error');
+      return false;
+    }
+    if(!sb){toast('Supabase manager is not initialized. Refresh the page once.','error');return false;}
+    if(!session){
+      const auth=await sb.auth.getSession();
+      session=auth.data?.session||null;
+    }
+    if(!session){toast('Your Supabase session is not ready. Sign in or refresh the page.','error');return false;}
+    await loadData();
+    if(!profile){toast('Your active faculty profile could not be loaded.','error');return false;}
+    return true;
+  }
+  async function openManager(kind){
+    if(!await ensureReady())return;
+    injectButtons();
+    if(kind==='ct')renderCtManager();
+    if(kind==='sessional')renderSessionalManager();
+    if(kind==='health')renderHealth();
+  }
 
   function renderCtManager(selected){
     const cs=theoryCourses();selected=selected||cs[0]?.id||'';
