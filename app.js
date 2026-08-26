@@ -23,15 +23,19 @@
   };
   const STAGE_ORDER = ['Question Preparation','Question Moderation','Script Examination','Script Scrutiny','Gradesheet Preparation','Gradesheet Scrutiny'];
   const STATUS_LABEL = {not_started:'Not Started',waiting:'Waiting',in_progress:'In Progress',submitted:'Submitted',completed:'Completed',overdue:'Overdue',blocked:'Blocked'};
-  const CT_STATUS_LABEL = {proposed:'Proposed',confirmed:'Confirmed',completed:'Completed',postponed:'Postponed',rescheduled:'Rescheduled',cancelled:'Cancelled'};
-  const LAB_STATUS_LABEL = {not_started:'Not Started',scheduled:'Scheduled',in_progress:'In Progress',conducted:'Conducted',submission_pending:'Submission Pending',evaluation_pending:'Evaluation Pending',completed:'Completed',cancelled:'Cancelled',setup_required:'Setup Required',configured:'Configured'};
+  const CT_STATUS_LABEL = {not_planned:'Not Started / Not Planned',scheduled:'CT Scheduled',ct_taken:'CT Taken',scripts_under_examination:'Scripts Under Examination',scripts_checked:'Scripts Checked',marks_published:'Marks Published',proposed:'Proposed',confirmed:'CT Scheduled',completed:'Marks Published',postponed:'Postponed',rescheduled:'Rescheduled',cancelled:'Cancelled'};
+  const SESSIONAL_STATUS_LABEL = {not_started:'Not Started',scheduled:'Scheduled',in_progress:'In Progress',conducted:'Conducted',submission_pending:'Submission Pending',evaluation_pending:'Evaluation Pending',completed:'Completed',cancelled:'Cancelled',setup_required:'Setup Required',configured:'Configured',evaluation_taken:'Evaluation Taken',marking_complete:'Marking Complete',marks_uploaded:'Marks Uploaded in Excel'};
+  const OUTLINE_STATUS_LABEL = {not_started:'Not Started',under_preparation:'Under Preparation',prepared:'Prepared',shared_with_students:'Shared with Students'};
   const FACULTY_EMAIL_RE = /^[^@\s]+@bme\.buet\.ac\.bd$/i;
   const TEST_ADMIN_EMAIL = 'sadmansakib715@gmail.com';
 
   const state = {
     supabase:null, demo:false, session:null, profile:null,
     faculty:[], courses:[], primaryAssignments:[], statuses:[], deadlines:[], auditLogs:[],
-    term:null, academicWeeks:[], courseFaculty:[], classTests:[], classTestHistory:[],
+    term:null, academicWeeks:[], termMilestones:[], courseSections:[], courseFaculty:[], classTests:[], classTestHistory:[],
+    courseOutlines:[], feedbackStatuses:[], courseFileStatuses:[],
+    sessionalConfigs:[], sessionalSessions:[], assessmentComponents:[], assessmentInstances:[],
+    sessionalGradeAssignments:[], sessionalGradeStatuses:[],
     labConfigs:[], labSessions:[], labAssessmentTypes:[], labAssessmentItems:[], labActivityAssignments:[],
     events:[], notifications:[], view:'home', courseId:null, search:'', statusFilter:'all', calendarFilter:'all',
     selectedWeek:null, modal:null
@@ -51,10 +55,16 @@
   const courseById = id => byId(state.courses,id) || {};
   const activeTerm = () => state.term || defaultTerm();
   const assignmentFor = courseId => state.primaryAssignments.find(a=>a.course_id===courseId) || {};
-  const labConfigFor = courseId => state.labConfigs.find(c=>c.course_id===courseId) || {};
-  const labSessionsFor = courseId => state.labSessions.filter(s=>s.course_id===courseId);
-  const labItemsFor = courseId => state.labAssessmentItems.filter(i=>i.course_id===courseId);
+  const sessionalConfigFor = courseId => state.sessionalConfigs.find(c=>c.course_id===courseId) || state.labConfigs.find(c=>c.course_id===courseId) || {};
+  const sessionalSessionsFor = courseId => (state.sessionalSessions.length ? state.sessionalSessions : state.labSessions).filter(s=>s.course_id===courseId);
+  const assessmentComponentsFor = courseId => (state.assessmentComponents.length ? state.assessmentComponents : state.labAssessmentTypes).filter(t=>t.course_id===courseId);
+  const assessmentInstancesFor = courseId => (state.assessmentInstances.length ? state.assessmentInstances : state.labAssessmentItems).filter(i=>i.course_id===courseId);
+  const labConfigFor = sessionalConfigFor;
+  const labSessionsFor = sessionalSessionsFor;
+  const labItemsFor = assessmentInstancesFor;
   const classTestsFor = courseId => state.classTests.filter(c=>c.course_id===courseId);
+  const ctDate = ct => ct.scheduled_date || ct.date || null;
+  const ctTime = ct => ct.scheduled_time || ct.time || '';
 
   function defaultTerm(){
     return {id:'term-local', name:cfg.academicTerm || 'January 2026', total_teaching_weeks:14, latest_completed_week:9, calendar_status:'active', pause_reason:'', active:true};
@@ -62,11 +72,16 @@
   function suggestCourseType(code=''){
     const match = String(code).match(/(\d{3})\b/);
     if(!match) return 'theory';
-    return Number(match[1]) % 2 === 0 ? 'lab' : 'theory';
+    return Number(match[1]) % 2 === 0 ? 'sessional' : 'theory';
   }
-  function courseType(course){ return course.course_type || suggestCourseType(course.course_code); }
+  function courseType(course){
+    const raw = String(course.course_type || suggestCourseType(course.course_code)).toLowerCase();
+    if(raw === 'lab') return 'sessional';
+    return raw === 'theory' ? 'theory' : 'sessional';
+  }
   function isTheoryCourse(course){ return courseType(course) === 'theory'; }
-  function isLabCourse(course){ return courseType(course) === 'lab'; }
+  function isSessionalCourse(course){ return courseType(course) === 'sessional'; }
+  function isLabCourse(course){ return isSessionalCourse(course); }
   function statusRow(courseId,key){ return state.statuses.find(s=>s.course_id===courseId && s.task_key===key); }
   function dueDateFor(course,key){
     const override = state.deadlines.find(d=>d.course_id===course.id && d.task_key===key)?.due_date;
@@ -88,7 +103,8 @@
     return task ? a[task.source] || null : null;
   }
   function theoryCourses(){ return state.courses.filter(isTheoryCourse); }
-  function labCourses(){ return state.courses.filter(isLabCourse); }
+  function sessionalCourses(){ return state.courses.filter(isSessionalCourse); }
+  function labCourses(){ return sessionalCourses(); }
   function taskObjects(){
     return theoryCourses().flatMap(course => TASKS.map(task => ({
       ...task, kind:'theory', course, assignee_id:assigneeFor(course.id,task.key), status:statusFor(course,task.key), due_date:dueDateFor(course,task.key)
@@ -109,15 +125,32 @@
   }
   function myTheoryTasks(){ return taskObjects().filter(t=>t.assignee_id===profileFacultyId()); }
   function myClassTests(){ return state.classTests.filter(ct=>ct.responsible_faculty===profileFacultyId() || courseIsMine(courseById(ct.course_id))); }
-  function myLabSessions(){ return state.labSessions.filter(s=>s.assigned_faculty===profileFacultyId() || courseIsMine(courseById(s.course_id))); }
-  function myLabItems(){ return state.labAssessmentItems.filter(i=>i.responsible_faculty===profileFacultyId() || courseIsMine(courseById(i.course_id))); }
+  function mySessionalSessions(){ return (state.sessionalSessions.length ? state.sessionalSessions : state.labSessions).filter(s=>s.assigned_faculty===profileFacultyId() || courseIsMine(courseById(s.course_id))); }
+  function myAssessmentInstances(){ return (state.assessmentInstances.length ? state.assessmentInstances : state.labAssessmentItems).filter(i=>i.responsible_faculty===profileFacultyId() || courseIsMine(courseById(i.course_id))); }
+  function myLabSessions(){ return mySessionalSessions(); }
+  function myLabItems(){ return myAssessmentInstances(); }
   function progressPct(items){ if(!items.length) return 0; return Math.round(items.filter(t=>['completed','conducted','configured'].includes(t.status)).length/items.length*100); }
   function statusBadge(status, labels=STATUS_LABEL){
     return `<span class="badge ${esc(status)}">${esc(labels[status] || status || 'Unknown')}</span>`;
   }
   function typeBadge(course){
     const type = courseType(course);
-    return `<span class="badge ${type}">${type === 'lab' ? 'Lab' : 'Theory'}</span>`;
+    return `<span class="badge ${type}">${type === 'sessional' ? 'Sessional' : 'Theory'}</span>`;
+  }
+  function milestoneLabel(type=''){
+    const labels = {
+      COURSE_OUTLINE_SHARING:'Course Outline Sharing Deadline',
+      QUESTION_SUBMISSION_DEADLINE:'Question Submission Deadline',
+      FEEDBACK_START:'Feedback Start',
+      FEEDBACK_DEADLINE:'Feedback Deadline',
+      THEORY_GRADESHEET_DEADLINE:'Theory Gradesheet Deadline',
+      SESSIONAL_GRADESHEET_DEADLINE:'Sessional Gradesheet Deadline',
+      CAR_DEADLINE:'Course File / CAR Deadline'
+    };
+    return labels[type] || String(type || 'Term Milestone').replace(/_/g,' ').toLowerCase().replace(/\b\w/g,c=>c.toUpperCase());
+  }
+  function milestoneDate(type){
+    return state.termMilestones.find(m=>m.milestone_type===type)?.milestone_date || null;
   }
   function weekForDate(date){
     if(!date) return null;
@@ -130,24 +163,46 @@
   }
   function eventsForAll(){
     const events = [];
+    for(const m of state.termMilestones){
+      events.push({id:`milestone-${m.id}`, type:'Deadline', date:m.milestone_date, time:'', week:weekForDate(m.milestone_date), courseId:m.course_id, course:courseById(m.course_id), title:milestoneLabel(m.milestone_type), status:m.status || 'scheduled', facultyId:m.faculty_id, detail:m.notes || 'Term-level milestone'});
+    }
     for(const row of state.events){
       const c = courseById(row.course_id);
       events.push({id:`event-${row.id}`, type:row.event_type || 'Academic Event', date:row.event_date, time:row.event_time || '', week:weekForDate(row.event_date), courseId:row.course_id, course:c, title:row.title, status:row.status || 'scheduled', facultyId:row.faculty_id, detail:row.source_table ? `Source: ${row.source_table}` : facultyName(row.faculty_id)});
+    }
+    for(const o of state.courseOutlines){
+      const c = courseById(o.course_id);
+      const due = o.due_date || milestoneDate('COURSE_OUTLINE_SHARING');
+      if(due) events.push({id:`outline-${o.course_id}`, type:'Course Outline', date:due, time:'', week:weekForDate(due), courseId:o.course_id, course:c, title:'Course outline sharing', status:o.status || 'not_started', facultyId:o.responsible_faculty, detail:OUTLINE_STATUS_LABEL[o.status] || 'Not Started'});
     }
     for(const t of taskObjects()){
       if(t.due_date) events.push({id:`task-${t.course.id}-${t.key}`, type:'Theory Deadline', date:t.due_date, time:'', week:weekForDate(t.due_date), courseId:t.course.id, course:t.course, title:t.label, status:t.status, facultyId:t.assignee_id, detail:`Responsible: ${facultyName(t.assignee_id)}`});
     }
     for(const ct of state.classTests){
       const c = courseById(ct.course_id);
-      events.push({id:`ct-${ct.id}`, type:'Class Test', date:ct.date, time:ct.time, week:weekForDate(ct.date), courseId:ct.course_id, course:c, title:`${ct.title} - Section ${ct.section || 'All'}`, status:ct.status, facultyId:ct.responsible_faculty, detail:`${ct.batch || c.batch || ''}${ct.syllabus ? ` | ${ct.syllabus}` : ''}`});
+      events.push({id:`ct-${ct.id}`, type:'Class Test', date:ctDate(ct), time:ctTime(ct), week:weekForDate(ctDate(ct)), courseId:ct.course_id, course:c, title:`${ct.title || `CT ${ct.ct_number || ''}`} - Section ${ct.section || 'All'}`, status:ct.status || 'not_planned', facultyId:ct.responsible_faculty || ct.responsible_faculty_id, detail:`${ct.batch || c.batch || ''}${ct.syllabus ? ` | ${ct.syllabus}` : ''}`});
     }
-    for(const s of state.labSessions){
+    const legacySessions = state.sessionalSessions.length ? [] : state.labSessions;
+    for(const s of legacySessions){
       const c = courseById(s.course_id);
-      events.push({id:`lab-${s.id}`, type:'Lab Session', date:s.date, time:'', week:weekForDate(s.date), courseId:s.course_id, course:c, title:`Lab ${String(s.session_no || '').padStart(2,'0')} - ${s.title}`, status:s.status, facultyId:s.assigned_faculty, detail:`${s.section || 'All'} ${s.group_label || ''}`});
+      events.push({id:`lab-${s.id}`, type:'Sessional Session', date:s.date, time:'', week:weekForDate(s.date), courseId:s.course_id, course:c, title:`Session ${String(s.session_no || '').padStart(2,'0')} - ${s.title}`, status:s.status, facultyId:s.assigned_faculty, detail:`${s.section || 'All'} ${s.group_label || ''}`});
     }
-    for(const i of state.labAssessmentItems){
+    for(const s of state.sessionalSessions){
+      const c = courseById(s.course_id);
+      events.push({id:`sessional-${s.id}`, type:'Sessional Session', date:s.date, time:s.scheduled_time || '', week:weekForDate(s.date), courseId:s.course_id, course:c, title:`Session ${String(s.session_no || s.sequence_number || '').padStart(2,'0')} - ${s.title}`, status:s.status, facultyId:s.assigned_faculty, detail:`${s.section || s.scope || 'Entire Course'} ${s.group_label || ''}`});
+    }
+    const legacyItems = state.assessmentInstances.length ? [] : state.labAssessmentItems;
+    for(const i of legacyItems.concat(state.assessmentInstances)){
       const c = courseById(i.course_id);
-      events.push({id:`assessment-${i.id}`, type:'Lab Assessment', date:i.due_date, time:'', week:weekForDate(i.due_date), courseId:i.course_id, course:c, title:i.title, status:i.status, facultyId:i.responsible_faculty, detail:`${i.marks || 0} marks | ${facultyName(i.responsible_faculty)}`});
+      events.push({id:`assessment-${i.id}`, type:'Sessional Assessment', date:i.due_date || i.scheduled_date, time:'', week:weekForDate(i.due_date || i.scheduled_date), courseId:i.course_id, course:c, title:i.title, status:i.status, facultyId:i.responsible_faculty, detail:`${i.marks || i.marks_each || 0} marks | ${facultyName(i.responsible_faculty)}`});
+    }
+    for(const f of state.feedbackStatuses){
+      const c = courseById(f.course_id), due=f.deadline || milestoneDate('FEEDBACK_DEADLINE');
+      if(due) events.push({id:`feedback-${f.course_id}`, type:'Feedback', date:due, time:'', week:weekForDate(due), courseId:f.course_id, course:c, title:'Student feedback', status:f.status || 'not_started', facultyId:f.responsible_faculty, detail:f.notes || 'Feedback workflow'});
+    }
+    for(const cf of state.courseFileStatuses){
+      const c = courseById(cf.course_id), due=cf.deadline || milestoneDate('CAR_DEADLINE');
+      if(due) events.push({id:`course-file-${cf.course_id}`, type:'Course File', date:due, time:'', week:weekForDate(due), courseId:cf.course_id, course:c, title:'Course File / CAR', status:cf.status || 'not_started', facultyId:cf.responsible_faculty, detail:cf.notes || 'Course file workflow'});
     }
     return events.filter(e=>e.date).sort((a,b)=>(a.date || '').localeCompare(b.date || '') || (a.time || '').localeCompare(b.time || ''));
   }
@@ -182,7 +237,7 @@
   function loadDemo(){
     state.demo=true;
     const d=window.EXAMFLOW_DEMO || {};
-    for(const key of ['faculty','courses','primaryAssignments','statuses','academicWeeks','courseFaculty','classTests','classTestHistory','labConfigs','labSessions','labAssessmentTypes','labAssessmentItems','events','notifications']){
+    for(const key of ['faculty','courses','primaryAssignments','statuses','academicWeeks','termMilestones','courseSections','courseFaculty','classTests','classTestHistory','courseOutlines','feedbackStatuses','courseFileStatuses','sessionalConfigs','sessionalSessions','assessmentComponents','assessmentInstances','sessionalGradeAssignments','sessionalGradeStatuses','labConfigs','labSessions','labAssessmentTypes','labAssessmentItems','events','notifications']){
       state[key]=clone(d[key] || []);
     }
     state.term=clone(d.term || defaultTerm());
@@ -245,11 +300,22 @@
     state.faculty=f.data||[];state.courses=c.data||[];state.primaryAssignments=a.data||[];state.statuses=s.data||[];state.deadlines=d.data||[];
     state.term = await loadActiveTerm();
     const termId = state.term.id;
-    const [weeks,courseFaculty,classTests,classTestHistory,labConfigs,labSessions,labAssessmentTypes,labAssessmentItems,labActivityAssignments,events,notifications] = await Promise.all([
+    const [weeks,termMilestones,courseSections,courseFaculty,classTests,classTestHistory,courseOutlines,feedbackStatuses,courseFileStatuses,sessionalConfigs,sessionalSessions,assessmentComponents,assessmentInstances,sessionalGradeAssignments,sessionalGradeStatuses,labConfigs,labSessions,labAssessmentTypes,labAssessmentItems,labActivityAssignments,events,notifications] = await Promise.all([
       selectOptional('academic_weeks', q=>q.select('*').eq('term_id',termId).order('week_no')),
+      selectOptional('term_milestones', q=>q.select('*').eq('term_id',termId).order('milestone_date')),
+      selectOptional('course_sections', q=>q.select('*')),
       selectOptional('course_faculty', q=>q.select('*')),
       selectOptional('class_tests', q=>q.select('*').order('date')),
       selectOptional('class_test_history', q=>q.select('*').order('created_at',{ascending:false})),
+      selectOptional('course_outline_statuses', q=>q.select('*')),
+      selectOptional('feedback_statuses', q=>q.select('*')),
+      selectOptional('course_file_statuses', q=>q.select('*')),
+      selectOptional('sessional_course_configs', q=>q.select('*')),
+      selectOptional('sessional_sessions', q=>q.select('*').order('date')),
+      selectOptional('assessment_components', q=>q.select('*')),
+      selectOptional('assessment_instances', q=>q.select('*').order('due_date')),
+      selectOptional('sessional_grade_assignments', q=>q.select('*')),
+      selectOptional('sessional_grade_statuses', q=>q.select('*')),
       selectOptional('lab_course_config', q=>q.select('*')),
       selectOptional('lab_sessions', q=>q.select('*').order('date')),
       selectOptional('lab_assessment_types', q=>q.select('*')),
@@ -258,7 +324,7 @@
       selectOptional('academic_events', q=>q.select('*').order('event_date')),
       selectOptional('notifications', q=>q.select('*').order('created_at',{ascending:false}).limit(80))
     ]);
-    Object.assign(state,{academicWeeks:weeks,courseFaculty,classTests,classTestHistory,labConfigs,labSessions,labAssessmentTypes,labAssessmentItems,labActivityAssignments,events,notifications});
+    Object.assign(state,{academicWeeks:weeks,termMilestones,courseSections,courseFaculty,classTests,classTestHistory,courseOutlines,feedbackStatuses,courseFileStatuses,sessionalConfigs,sessionalSessions,assessmentComponents,assessmentInstances,sessionalGradeAssignments,sessionalGradeStatuses,labConfigs,labSessions,labAssessmentTypes,labAssessmentItems,labActivityAssignments,events,notifications});
     if(!state.selectedWeek) state.selectedWeek=state.term.latest_completed_week || 1;
     state.auditLogs=[];
     if(isAdmin()){
@@ -270,17 +336,17 @@
 
   function renderLocked(){
     $app.innerHTML=`<div class="locked"><div class="locked-card">
-      <p class="eyebrow">Secure deployment not configured</p><h1>BME <span style="color:var(--accent)">ExamFlow</span></h1>
+      <p class="eyebrow">Secure deployment not configured</p><h1>BME <span style="color:var(--accent)">Workflow</span></h1>
       <p>This copy is intentionally locked. No academic data is embedded in the public site. Configure Supabase authentication and Row Level Security before production deployment.</p>
       <div class="code-note">Production: configure GitHub repository variables SUPABASE_URL and SUPABASE_ANON_KEY.<br>Local anonymous preview: append <b>?demo=1</b> to the URL.</div>
     </div></div>`;
   }
-  function renderFatal(msg){$app.innerHTML=`<div class="locked"><div class="locked-card"><p class="eyebrow">System error</p><h1>ExamFlow</h1><div class="notice error">${esc(msg)}</div></div></div>`;}
+  function renderFatal(msg){$app.innerHTML=`<div class="locked"><div class="locked-card"><p class="eyebrow">System error</p><h1>BME Workflow</h1><div class="notice error">${esc(msg)}</div></div></div>`;}
   function renderUnauthorized(){ $app.innerHTML=`<div class="locked"><div class="locked-card"><p class="eyebrow">Access denied</p><h1>Unauthorized account</h1><p>Your login succeeded, but this account is not on the approved faculty allowlist. No academic data has been disclosed.</p></div></div>`; }
 
   function renderAuth(message='', type=''){
     $app.innerHTML=`<div class="auth-page"><div class="auth-wrap">
-      <div class="auth-brand"><p class="eyebrow">Secure Academic Workflow</p><h1 class="brand">BME <span>ExamFlow</span></h1><p class="subtitle">Faculty-centered examination responsibility management.</p></div>
+      <div class="auth-brand"><p class="eyebrow">Secure Academic Workflow</p><h1 class="brand">BME <span>Workflow</span></h1><p class="subtitle">Complete faculty academic activity management.</p></div>
       <div class="auth-grid">
         <div class="auth-card"><span class="kicker">Existing Account</span><h2>Sign in</h2><p>Use your BME BUET faculty email and the password you set during sign up.</p>
           <form id="signinForm"><div class="field"><label>Email</label><input type="email" name="email" required autocomplete="username" placeholder="name@bme.buet.ac.bd"><div class="field-help">Only @bme.buet.ac.bd addresses are accepted.</div></div><div class="field"><label>Password</label><input type="password" name="password" required autocomplete="current-password"></div><div class="auth-actions"><button class="btn primary" type="submit">Sign in</button><button class="btn" type="button" id="magicBtn">Email magic link</button></div></form>
@@ -366,7 +432,7 @@
     if(isAdmin()) nav.push(['setup','S','Setup Centre'],['conflicts','!','Conflicts'],['admin','A','Admin']);
     const term=activeTerm();
     return `<div class="shell">
-      <header class="topbar"><div><p class="eyebrow">Academic Responsibility Management</p><h1 class="brand">BME <span>ExamFlow</span></h1><p class="subtitle">Faculty-centered examination responsibility management across theory, CT, and lab work.</p></div><div class="term-badge"><b>${esc(term.name)}</b>Academic Week ${esc(term.latest_completed_week || 0)} of ${esc(term.total_teaching_weeks || 0)}<br>${state.demo?'DEMO ADMIN':'Authenticated'}</div></header>
+      <header class="topbar"><div><p class="eyebrow">Academic Responsibility Management</p><h1 class="brand">BME <span>Workflow</span></h1><p class="subtitle">Faculty-centered academic activity management across theory, CT, sessional, feedback, and course-file work.</p></div><div class="term-badge"><b>${esc(term.name)}</b>Academic Week ${esc(term.latest_completed_week || 0)} of ${esc(term.total_teaching_weeks || 0)}<br>${state.demo?'DEMO ADMIN':'Authenticated'}</div></header>
       <div class="app-grid"><aside class="sidebar"><div class="profile-mini"><p class="profile-name">${esc(f.full_name||'Faculty')}</p><div class="profile-meta">${esc(f.designation||'')} | ${esc(state.profile.app_role||'faculty').toUpperCase()}</div></div><nav class="nav">${nav.map(([v,i,l])=>`<button data-nav="${v}" class="${state.view===v?'active':''}"><span>${i}</span>${l}</button>`).join('')}<button id="logoutBtn"><span>Q</span>${state.demo?'Exit Demo':'Logout'}</button></nav></aside><main class="main">${content}</main></div>
     </div><div id="modalRoot"></div>`;
   }
@@ -406,13 +472,14 @@
     const theory=myTheoryTasks();
     const myEvents=myAcademicEvents();
     const dueWeek=myEvents.filter(e=>daysFromToday(e.date)>=0 && daysFromToday(e.date)<=7 && !['completed','cancelled'].includes(e.status)).length;
+    const todayEvents=myEvents.filter(e=>e.date===todayIso()).slice(0,5);
     const needs=attentionItems().slice(0,7);
-    const cts=myClassTests().filter(ct=>daysFromToday(ct.date)>=0).sort((a,b)=>a.date.localeCompare(b.date)).slice(0,5);
-    const labs=[...myLabSessions(),...myLabItems()].filter(x=>daysFromToday(x.date || x.due_date)>=0).sort((a,b)=>(a.date || a.due_date).localeCompare(b.date || b.due_date)).slice(0,5);
+    const cts=myClassTests().filter(ct=>daysFromToday(ctDate(ct))>=0).sort((a,b)=>(ctDate(a) || '').localeCompare(ctDate(b) || '')).slice(0,5);
+    const sessional=[...myLabSessions(),...myLabItems()].filter(x=>daysFromToday(x.date || x.due_date || x.scheduled_date)>=0).sort((a,b)=>(a.date || a.due_date || a.scheduled_date || '').localeCompare(b.date || b.due_date || b.scheduled_date || '')).slice(0,5);
     const recent=recentChanges().slice(0,5);
     return `${renderTermTracker()}<div class="page-head"><div><p class="eyebrow">Personal Home</p><h2>Good ${dayPart()}, ${esc(firstName(state.profile?.faculty?.full_name||facultyName(profileFacultyId())))}</h2><p>Your feed prioritizes what to do next, who is waiting, and what changed recently.</p></div></div>
-      <div class="metrics"><div class="metric"><div class="metric-label">Needs attention</div><div class="metric-value">${needs.length}</div><div class="metric-note">Theory, CT, and lab items</div></div><div class="metric"><div class="metric-label">Due this week</div><div class="metric-value">${dueWeek}</div><div class="metric-note">Academic Week ${esc(activeTerm().latest_completed_week)}</div></div><div class="metric"><div class="metric-label">Upcoming CTs</div><div class="metric-value">${cts.length}</div><div class="metric-note">Assigned or course-linked</div></div><div class="metric"><div class="metric-label">Lab activities</div><div class="metric-value">${labs.length}</div><div class="metric-note">Sessions and assessments</div></div></div>
-      <div class="home-grid"><section class="panel"><div class="panel-title"><h3>Needs Attention</h3><span class="meta">PRIORITY</span></div><div class="stack">${needs.length?needs.map(actionCard).join(''):'<div class="empty">Nothing urgent right now.</div>'}</div></section><section class="panel"><div class="panel-title"><h3>Upcoming CTs</h3><span class="meta">CALENDAR</span></div><div class="stack">${cts.length?cts.map(ctCard).join(''):'<div class="empty">No upcoming class tests.</div>'}</div></section><section class="panel"><div class="panel-title"><h3>Upcoming Lab Activities</h3><span class="meta">LAB</span></div><div class="stack">${labs.length?labs.map(labSmallCard).join(''):'<div class="empty">No upcoming lab activities.</div>'}</div></section><section class="panel"><div class="panel-title"><h3>Recently Changed</h3><span class="meta">AUDIT</span></div><div class="stack">${recent.length?recent.map(changeCard).join(''):'<div class="empty">No recent changes recorded.</div>'}</div></section></div>`;
+      <div class="metrics"><div class="metric"><div class="metric-label">Needs attention</div><div class="metric-value">${needs.length}</div><div class="metric-note">Theory, CT, and sessional items</div></div><div class="metric"><div class="metric-label">Due this week</div><div class="metric-value">${dueWeek}</div><div class="metric-note">Academic Week ${esc(activeTerm().latest_completed_week)}</div></div><div class="metric"><div class="metric-label">Upcoming CTs</div><div class="metric-value">${cts.length}</div><div class="metric-note">Assigned or course-linked</div></div><div class="metric"><div class="metric-label">Sessional activities</div><div class="metric-value">${sessional.length}</div><div class="metric-note">Sessions and assessments</div></div></div>
+      <div class="home-grid"><section class="panel"><div class="panel-title"><h3>Needs Attention</h3><span class="meta">PRIORITY</span></div><div class="stack">${needs.length?needs.map(actionCard).join(''):'<div class="empty">Nothing urgent right now.</div>'}</div></section><section class="panel"><div class="panel-title"><h3>Today</h3><span class="meta">${todayEvents.length} EVENTS</span></div><div class="stack">${todayEvents.length?todayEvents.map(eventCard).join(''):'<div class="empty">No academic events today.</div>'}</div></section><section class="panel"><div class="panel-title"><h3>Upcoming CTs</h3><span class="meta">CALENDAR</span></div><div class="stack">${cts.length?cts.map(ctCard).join(''):'<div class="empty">No upcoming class tests.</div>'}</div></section><section class="panel"><div class="panel-title"><h3>Upcoming Sessional Activities</h3><span class="meta">SESSIONAL</span></div><div class="stack">${sessional.length?sessional.map(labSmallCard).join(''):'<div class="empty">No upcoming sessional activities.</div>'}</div></section><section class="panel"><div class="panel-title"><h3>Recently Changed</h3><span class="meta">AUDIT</span></div><div class="stack">${recent.length?recent.map(changeCard).join(''):'<div class="empty">No recent changes recorded.</div>'}</div></section></div>`;
   }
 
   function renderTermTracker(){
@@ -429,44 +496,51 @@
   }
   function renderWeekPlanner(weekNo){
     const events=eventsForAll().filter(e=>e.week===weekNo).slice(0,6);
-    return `<div class="week-planner"><div><p class="eyebrow">Academic Week ${esc(weekNo)}</p><h3>Light Planner</h3></div><div class="mini-event-list">${events.length?events.map(e=>`<div class="mini-event" data-open-course="${esc(e.courseId)}"><b>${esc(e.type)}</b><span>${esc(e.course?.course_code || '')} | ${esc(e.title)} | ${fmtDate(e.date)}</span></div>`).join(''):'<div class="empty compact">No CTs, lab activities, or deadlines mapped to this week.</div>'}</div></div>`;
+    return `<div class="week-planner"><div><p class="eyebrow">Academic Week ${esc(weekNo)}</p><h3>Light Planner</h3></div><div class="mini-event-list">${events.length?events.map(e=>`<div class="mini-event" data-open-course="${esc(e.courseId)}"><b>${esc(e.type)}</b><span>${esc(e.course?.course_code || '')} | ${esc(e.title)} | ${fmtDate(e.date)}</span></div>`).join(''):'<div class="empty compact">No CTs, sessional activities, or deadlines mapped to this week.</div>'}</div></div>`;
   }
 
   function renderTasks(){
     let rows=[
       ...myTheoryTasks().map(t=>({kind:'Theory', title:t.label, course:t.course, date:t.due_date, status:t.status, assignee:t.assignee_id, raw:t})),
-      ...myClassTests().map(ct=>({kind:'Class Test', title:ct.title, course:courseById(ct.course_id), date:ct.date, status:ct.status, assignee:ct.responsible_faculty, raw:ct})),
-      ...myLabSessions().map(s=>({kind:'Lab Session', title:`Lab ${s.session_no} - ${s.title}`, course:courseById(s.course_id), date:s.date, status:s.status, assignee:s.assigned_faculty, raw:s})),
-      ...myLabItems().map(i=>({kind:'Lab Assessment', title:i.title, course:courseById(i.course_id), date:i.due_date, status:i.status, assignee:i.responsible_faculty, raw:i}))
+      ...myClassTests().map(ct=>({kind:'Class Test', title:ct.title || `CT ${ct.ct_number || ''}`, course:courseById(ct.course_id), date:ctDate(ct), status:ct.status || 'not_planned', assignee:ct.responsible_faculty || ct.responsible_faculty_id, raw:ct})),
+      ...myLabSessions().map(s=>({kind:'Sessional Session', title:`Session ${s.session_no || s.sequence_number || ''} - ${s.title}`, course:courseById(s.course_id), date:s.date || s.scheduled_date, status:s.status, assignee:s.assigned_faculty, raw:s})),
+      ...myLabItems().map(i=>({kind:'Sessional Assessment', title:i.title, course:courseById(i.course_id), date:i.due_date || i.scheduled_date, status:i.status, assignee:i.responsible_faculty, raw:i})),
+      ...state.courseOutlines.filter(o=>courseIsMine(courseById(o.course_id))).map(o=>({kind:'Course Outline', title:'Course outline sharing', course:courseById(o.course_id), date:o.due_date || milestoneDate('COURSE_OUTLINE_SHARING'), status:o.status || 'not_started', assignee:o.responsible_faculty, raw:o})),
+      ...state.feedbackStatuses.filter(f=>courseIsMine(courseById(f.course_id))).map(f=>({kind:'Feedback', title:'Student feedback', course:courseById(f.course_id), date:f.deadline || milestoneDate('FEEDBACK_DEADLINE'), status:f.status || 'not_started', assignee:f.responsible_faculty, raw:f})),
+      ...state.courseFileStatuses.filter(cf=>courseIsMine(courseById(cf.course_id))).map(cf=>({kind:'Course File / CAR', title:'Course File / CAR', course:courseById(cf.course_id), date:cf.deadline || milestoneDate('CAR_DEADLINE'), status:cf.status || 'not_started', assignee:cf.responsible_faculty, raw:cf}))
     ];
     if(state.search){const q=state.search.toLowerCase();rows=rows.filter(t=>`${t.kind} ${t.course.course_code} ${t.course.title} ${t.title}`.toLowerCase().includes(q));}
     if(state.statusFilter!=='all') rows=rows.filter(t=>t.status===state.statusFilter);
     rows.sort((a,b)=>prioritySort({status:a.status,due_date:a.date},{status:b.status,due_date:b.date}));
-    const statusOptions={...STATUS_LABEL,...CT_STATUS_LABEL,...LAB_STATUS_LABEL};
-    return `<div class="page-head"><div><p class="eyebrow">Personal Responsibility Queue</p><h2>My Tasks</h2><p>Theory workflow tasks, class tests, lab sessions, and lab assessments in one list.</p></div><div class="toolbar"><input id="taskSearch" class="search" placeholder="Search course or responsibility" value="${esc(state.search)}"><select id="statusFilter" class="select"><option value="all">All statuses</option>${Object.entries(statusOptions).map(([v,l])=>`<option value="${v}" ${state.statusFilter===v?'selected':''}>${l}</option>`).join('')}</select></div></div>
+    const statusOptions={...STATUS_LABEL,...CT_STATUS_LABEL,...SESSIONAL_STATUS_LABEL,...OUTLINE_STATUS_LABEL};
+    return `<div class="page-head"><div><p class="eyebrow">Personal Responsibility Queue</p><h2>My Tasks</h2><p>Theory workflow tasks, class tests, sessional sessions, and sessional assessments in one list.</p></div><div class="toolbar"><input id="taskSearch" class="search" placeholder="Search course or responsibility" value="${esc(state.search)}"><select id="statusFilter" class="select"><option value="all">All statuses</option>${Object.entries(statusOptions).map(([v,l])=>`<option value="${v}" ${state.statusFilter===v?'selected':''}>${l}</option>`).join('')}</select></div></div>
       <section class="panel"><div class="stack">${rows.length?rows.map(unifiedTaskCard).join(''):'<div class="empty">No tasks match this filter.</div>'}</div></section>`;
   }
 
   function renderCourses(){
     const mine=state.courses.filter(courseIsMine);
-    const theory=mine.filter(isTheoryCourse), labs=mine.filter(isLabCourse);
-    return `<div class="page-head"><div><p class="eyebrow">Personal Course Feed</p><h2>My Courses</h2><p>Theory and lab courses are separated because their workflows are intentionally different.</p></div></div>
+    const theory=mine.filter(isTheoryCourse), sessional=mine.filter(isSessionalCourse);
+    return `<div class="page-head"><div><p class="eyebrow">Personal Course Feed</p><h2>My Courses</h2><p>Theory and sessional courses are separated because their workflows are intentionally different.</p></div></div>
       <section class="panel"><div class="panel-title"><h3>Theory Courses</h3><span class="meta">${theory.length} ACTIVE</span></div><div class="course-grid">${theory.map(c=>courseCard(c,true)).join('')||'<div class="empty">No assigned theory courses.</div>'}</div></section>
-      <section class="panel"><div class="panel-title"><h3>Lab Courses</h3><span class="meta">${labs.length} ACTIVE</span></div><div class="course-grid">${labs.map(c=>courseCard(c,true)).join('')||'<div class="empty">No assigned lab courses.</div>'}</div></section>`;
+      <section class="panel"><div class="panel-title"><h3>Sessional Courses</h3><span class="meta">${sessional.length} ACTIVE</span></div><div class="course-grid">${sessional.map(c=>courseCard(c,true)).join('')||'<div class="empty">No assigned sessional courses.</div>'}</div></section>`;
   }
 
   function renderGeneral(){
     const all=taskObjects(), events=eventsForAll(), pct=progressPct(all), pending=all.filter(t=>t.status!=='completed').length;
-    const ctWeek=state.classTests.filter(ct=>daysFromToday(ct.date)>=0 && daysFromToday(ct.date)<=7).length;
-    const labPending=[...state.labSessions,...state.labAssessmentItems].filter(x=>!['completed','cancelled'].includes(x.status)).length;
+    const ctWeek=state.classTests.filter(ct=>daysFromToday(ctDate(ct))>=0 && daysFromToday(ctDate(ct))<=7).length;
+    const sessionalPending=[...(state.sessionalSessions.length ? state.sessionalSessions : state.labSessions),...(state.assessmentInstances.length ? state.assessmentInstances : state.labAssessmentItems)].filter(x=>!['completed','cancelled','marks_uploaded'].includes(x.status)).length;
+    const outlinesShared=state.courseOutlines.filter(x=>x.status==='shared_with_students').length;
+    const feedbackDone=state.feedbackStatuses.filter(x=>x.status==='completed').length;
+    const carDone=state.courseFileStatuses.filter(x=>x.status==='uploaded' || x.status==='completed').length;
     const overdue=events.filter(e=>e.date < todayIso() && !['completed','conducted','cancelled'].includes(e.status)).length;
-    return `${renderTermTracker()}<div class="page-head"><div><p class="eyebrow">Department Summary</p><h2>General Overview</h2><p>Operational progress only. No question-paper content is exposed.</p></div></div><div class="metrics"><div class="metric"><div class="metric-label">Theory progress</div><div class="metric-value">${pct}%</div><div class="metric-note">${all.filter(t=>t.status==='completed').length} of ${all.length} tasks</div></div><div class="metric"><div class="metric-label">Pending theory</div><div class="metric-value">${pending}</div><div class="metric-note">Across ${theoryCourses().length} theory courses</div></div><div class="metric"><div class="metric-label">CTs this week</div><div class="metric-value">${ctWeek}</div><div class="metric-note">Proposed and confirmed included</div></div><div class="metric"><div class="metric-label">Lab pending</div><div class="metric-value">${labPending}</div><div class="metric-note">Sessions and assessments</div></div></div>
+    return `${renderTermTracker()}<div class="page-head"><div><p class="eyebrow">Department Summary</p><h2>General Overview</h2><p>Operational progress only. No question-paper content is exposed.</p></div></div><div class="metrics"><div class="metric"><div class="metric-label">Theory courses</div><div class="metric-value">${theoryCourses().length}</div><div class="metric-note">${pending} pending theory tasks</div></div><div class="metric"><div class="metric-label">Sessional courses</div><div class="metric-value">${labCourses().length}</div><div class="metric-note">${sessionalPending} pending activities</div></div><div class="metric"><div class="metric-label">CTs this week</div><div class="metric-value">${ctWeek}</div><div class="metric-note">Workbook CT lifecycle</div></div><div class="metric"><div class="metric-label">Outlines shared</div><div class="metric-value">${outlinesShared}/${state.courseOutlines.length || state.courses.length}</div><div class="metric-note">Global deadline ${fmtDate(milestoneDate('COURSE_OUTLINE_SHARING'))}</div></div></div>
+      <div class="metrics"><div class="metric"><div class="metric-label">Theory progress</div><div class="metric-value">${pct}%</div><div class="metric-note">${all.filter(t=>t.status==='completed').length} of ${all.length} tasks</div></div><div class="metric"><div class="metric-label">Feedback</div><div class="metric-value">${feedbackDone}/${state.feedbackStatuses.length || state.courses.length}</div><div class="metric-note">Student feedback workflow</div></div><div class="metric"><div class="metric-label">Course File / CAR</div><div class="metric-value">${carDone}/${state.courseFileStatuses.length || state.courses.length}</div><div class="metric-note">Archive readiness</div></div><div class="metric"><div class="metric-label">At risk</div><div class="metric-value">${overdue}</div><div class="metric-note">Overdue event signals</div></div></div>
       <div class="attention"><section class="panel"><div class="panel-title"><h3>Completion by Stage</h3><span class="meta">THEORY</span></div>${STAGE_ORDER.map(stage=>stageProgress(stage)).join('')}</section><section class="panel"><div class="panel-title"><h3>Course Health</h3><span class="meta">${overdue} OVERDUE SIGNALS</span></div><div class="health-list">${state.courses.map(healthItem).join('')}</div></section></div>`;
   }
 
   function renderCourseDetail(id){
     const c=byId(state.courses,id); if(!c){state.courseId=null;return renderHome();}
-    return isLabCourse(c) ? renderLabCourseDetail(c) : renderTheoryCourseDetail(c);
+    return isSessionalCourse(c) ? renderSessionalCourseDetail(c) : renderTheoryCourseDetail(c);
   }
   function renderTheoryCourseDetail(c){
     const tasks=TASKS.map(t=>({...t,course:c,assignee_id:assigneeFor(c.id,t.key),status:statusFor(c,t.key),due_date:dueDateFor(c,t.key)}));
@@ -474,22 +548,29 @@
     const cts=classTestsFor(c.id);
     return `<div class="page-head"><div><button class="btn small" id="backCourse">Back</button><p class="eyebrow" style="margin-top:15px">${esc(c.course_code)} | Theory | Academic Week ${esc(activeTerm().latest_completed_week)}</p><h2>${esc(c.title)}</h2><p>Question milestone: ${fmtDate(c.question_deadline)} | Final gradesheet milestone: ${fmtDate(c.final_gradesheet_deadline)}</p></div><div>${statusBadge(progressPct(tasks)===100?'completed':'in_progress')}</div></div>
       <section class="panel"><div class="panel-title"><h3>Theory Workflow</h3><span class="meta">${progressPct(tasks)}% COMPLETE</span></div><div class="workflow">${stages.map((s,i)=>workflowStage(s,i)).join('')}</div></section>
+      ${renderCourseOutline(c)}
       <section class="panel"><div class="panel-title"><h3>Class Tests</h3><span class="meta">${cts.length} CT ITEMS</span></div><div class="stack">${cts.length?cts.map(ctCard).join(''):'<div class="empty">No class tests scheduled for this course.</div>'}</div></section>`;
   }
-  function renderLabCourseDetail(c){
-    const config=labConfigFor(c.id), sessions=labSessionsFor(c.id), types=state.labAssessmentTypes.filter(t=>t.course_id===c.id), items=labItemsFor(c.id);
-    return `<div class="page-head"><div><button class="btn small" id="backCourse">Back</button><p class="eyebrow" style="margin-top:15px">${esc(c.course_code)} | Lab | Academic Week ${esc(activeTerm().latest_completed_week)}</p><h2>${esc(c.title)}</h2><p>Lab courses use configurable sessions and assessment items instead of the theory exam workflow.</p></div>${statusBadge(config.config_status || 'setup_required', LAB_STATUS_LABEL)}</div>
+  function renderSessionalCourseDetail(c){
+    const config=labConfigFor(c.id), sessions=labSessionsFor(c.id), types=assessmentComponentsFor(c.id), items=labItemsFor(c.id);
+    return `<div class="page-head"><div><button class="btn small" id="backCourse">Back</button><p class="eyebrow" style="margin-top:15px">${esc(c.course_code)} | Sessional ${c.sessional_subtype?`| ${esc(c.sessional_subtype)}`:''} | Academic Week ${esc(activeTerm().latest_completed_week)}</p><h2>${esc(c.title)}</h2><p>Sessional courses use configurable sessions, assessments, and gradesheet workflow instead of the theory exam workflow.</p></div>${statusBadge(config.config_status || 'setup_required', SESSIONAL_STATUS_LABEL)}</div>
       <div class="metrics"><div class="metric"><div class="metric-label">Sessions</div><div class="metric-value">${sessions.length || config.session_count || 0}</div><div class="metric-note">${progressPct(sessions)}% conducted/completed</div></div><div class="metric"><div class="metric-label">Assessment types</div><div class="metric-value">${types.length}</div><div class="metric-note">Reports, quiz, viva, test, final, custom</div></div><div class="metric"><div class="metric-label">Assessment items</div><div class="metric-value">${items.length}</div><div class="metric-note">${progressPct(items)}% complete</div></div><div class="metric"><div class="metric-label">Version</div><div class="metric-value">${config.version || 1}</div><div class="metric-note">Config changes are audited</div></div></div>
-      <section class="panel"><div class="panel-title"><h3>Assessment Components</h3><span class="meta">CONFIGURABLE</span></div>${types.length?`<div class="table-wrap"><table class="table"><thead><tr><th>Component</th><th>Marks</th><th>Count</th><th>Best/Drop</th><th>Responsible</th></tr></thead><tbody>${types.map(t=>`<tr><td>${esc(t.name)}</td><td>${esc(t.marks)}</td><td>${esc(t.count)}</td><td>${esc(t.best_of || t.count)}</td><td>${esc(facultyName(t.responsible_faculty))}</td></tr>`).join('')}</tbody></table></div>`:'<div class="empty">No assessment components configured yet.</div>'}</section>
-      <section class="panel"><div class="panel-title"><h3>Lab Sessions</h3><span class="meta">LAB 01...N</span></div><div class="stack">${sessions.length?sessions.map(labSmallCard).join(''):'<div class="empty">No lab sessions generated yet.</div>'}</div></section>
-      <section class="panel"><div class="panel-title"><h3>Assessment Items</h3><span class="meta">LINKED TO LABS</span></div><div class="stack">${items.length?items.map(labSmallCard).join(''):'<div class="empty">No assessment items generated yet.</div>'}</div></section>`;
+      ${renderCourseOutline(c)}
+      <section class="panel"><div class="panel-title"><h3>Assessment Components</h3><span class="meta">CONFIGURABLE</span></div>${types.length?`<div class="table-wrap"><table class="table"><thead><tr><th>Component</th><th>Marks</th><th>Count</th><th>Best/Drop</th><th>Scope</th><th>Responsible</th></tr></thead><tbody>${types.map(t=>`<tr><td>${esc(t.name)}</td><td>${esc(t.marks_each || t.marks || 0)}</td><td>${esc(t.quantity || t.count || 1)}</td><td>${esc(t.counted_quantity || t.best_of || t.quantity || t.count || 1)}</td><td>${esc(t.scope || t.section || 'Entire Course')}</td><td>${esc(facultyName(t.responsible_faculty))}</td></tr>`).join('')}</tbody></table></div>`:'<div class="empty">No assessment components configured yet.</div>'}</section>
+      <section class="panel"><div class="panel-title"><h3>Sessional Sessions</h3><span class="meta">SESSION 01...N</span></div><div class="stack">${sessions.length?sessions.map(labSmallCard).join(''):'<div class="empty">No sessional sessions generated yet.</div>'}</div></section>
+      <section class="panel"><div class="panel-title"><h3>Assessment Items</h3><span class="meta">LINKED TO SESSIONS</span></div><div class="stack">${items.length?items.map(labSmallCard).join(''):'<div class="empty">No assessment items generated yet.</div>'}</div></section>`;
+  }
+  function renderCourseOutline(c){
+    const outline=state.courseOutlines.find(o=>o.course_id===c.id) || {};
+    const due=outline.due_date || milestoneDate('COURSE_OUTLINE_SHARING');
+    return `<section class="panel"><div class="panel-title"><h3>Course Outline</h3><span class="meta">GLOBAL DEADLINE ${fmtDate(due)}</span></div><div class="health-item"><div class="health-main"><span class="health-dot ${outline.status==='shared_with_students'?'done':outline.status==='prepared'?'green':'yellow'}"></span><div><b>${esc(OUTLINE_STATUS_LABEL[outline.status || 'not_started'])}</b><div style="font-size:10px;color:var(--ink-soft)">Workflow: Under Preparation -> Prepared -> Shared with Students</div></div></div>${statusBadge(outline.status || 'not_started',OUTLINE_STATUS_LABEL)}</div></section>`;
   }
 
   function renderCtCalendar(){
-    const tests=[...state.classTests].sort((a,b)=>a.date.localeCompare(b.date) || (a.time || '').localeCompare(b.time || ''));
+    const tests=[...state.classTests].sort((a,b)=>(ctDate(a) || '').localeCompare(ctDate(b) || '') || ctTime(a).localeCompare(ctTime(b)));
     const conflicts=findCtConflicts();
     return `<div class="page-head"><div><p class="eyebrow">Class Test Module</p><h2>CT Calendar</h2><p>Month/week/batch/course views can be represented through the filters below. Conflict detection uses batch, section, date, and time.</p></div></div>
-      <div class="metrics"><div class="metric"><div class="metric-label">Scheduled CTs</div><div class="metric-value">${tests.length}</div><div class="metric-note">All statuses</div></div><div class="metric"><div class="metric-label">Confirmed</div><div class="metric-value">${tests.filter(t=>t.status==='confirmed').length}</div><div class="metric-note">Ready for execution</div></div><div class="metric"><div class="metric-label">Recent changes</div><div class="metric-value">${state.classTestHistory.length}</div><div class="metric-note">Reschedule history</div></div><div class="metric"><div class="metric-label">Conflicts</div><div class="metric-value">${conflicts.length}</div><div class="metric-note">Same slot overlap</div></div></div>
+      <div class="metrics"><div class="metric"><div class="metric-label">CT records</div><div class="metric-value">${tests.length}</div><div class="metric-note">Any count, not CT1-CT5 columns</div></div><div class="metric"><div class="metric-label">Marks published</div><div class="metric-value">${tests.filter(t=>['marks_published','completed'].includes(t.status)).length}</div><div class="metric-note">Final CT lifecycle stage</div></div><div class="metric"><div class="metric-label">Recent changes</div><div class="metric-value">${state.classTestHistory.length}</div><div class="metric-note">Reschedule history</div></div><div class="metric"><div class="metric-label">Conflicts</div><div class="metric-value">${conflicts.length}</div><div class="metric-note">Same slot overlap</div></div></div>
       <section class="panel"><div class="panel-title"><h3>Class Tests</h3><span class="meta">BATCH / COURSE / MY COURSES</span></div><div class="calendar-list">${tests.map(ctCard).join('')||'<div class="empty">No class tests yet.</div>'}</div></section>
       <section class="panel"><div class="panel-title"><h3>CT Conflicts</h3><span class="meta">AUTOMATIC</span></div>${conflicts.map(x=>conflictBox(x,true)).join('') || '<div class="empty">No CT schedule conflicts detected.</div>'}</section>`;
   }
@@ -497,33 +578,36 @@
   function renderDepartmentCalendar(){
     let events=eventsForAll();
     if(state.calendarFilter!=='all') events=events.filter(e=>e.type===state.calendarFilter);
-    const filters=['all','Theory Deadline','Class Test','Lab Session','Lab Assessment'];
-    return `<div class="page-head"><div><p class="eyebrow">Universal Academic Events</p><h2>Department Calendar</h2><p>Shared event layer for theory deadlines, CTs, lab sessions, and lab assessments.</p></div><div class="toolbar">${filters.map(f=>`<button class="btn small ${state.calendarFilter===f?'primary':''}" data-calendar-filter="${esc(f)}">${esc(f)}</button>`).join('')}</div></div>
+    const filters=['all','Theory Deadline','Class Test','Sessional Session','Sessional Assessment','Course Outline','Feedback','Course File','Deadline'];
+    return `<div class="page-head"><div><p class="eyebrow">Universal Academic Events</p><h2>Department Calendar</h2><p>Shared event layer for theory deadlines, CTs, sessional activities, feedback, course files, and term milestones.</p></div><div class="toolbar">${filters.map(f=>`<button class="btn small ${state.calendarFilter===f?'primary':''}" data-calendar-filter="${esc(f)}">${esc(f)}</button>`).join('')}</div></div>
       <section class="panel"><div class="calendar-list">${events.map(eventCard).join('')||'<div class="empty">No events match this filter.</div>'}</div></section>`;
   }
 
   function renderWorkload(){
     const rows=state.faculty.map(f=>{
       const theory=taskObjects().filter(t=>t.assignee_id===f.id && t.status!=='completed').length;
-      const ct=state.classTests.filter(c=>c.responsible_faculty===f.id && !['completed','cancelled'].includes(c.status)).length;
-      const lab=state.labSessions.filter(s=>s.assigned_faculty===f.id && !['completed','cancelled'].includes(s.status)).length + state.labAssessmentItems.filter(i=>i.responsible_faculty===f.id && !['completed','cancelled'].includes(i.status)).length;
-      return {...f,theory,ct,lab,total:theory+ct+lab};
+      const ct=state.classTests.filter(c=>(c.responsible_faculty===f.id || c.responsible_faculty_id===f.id) && !['completed','marks_published','cancelled'].includes(c.status)).length;
+      const sessional=(state.sessionalSessions.length ? state.sessionalSessions : state.labSessions).filter(s=>s.assigned_faculty===f.id && !['completed','cancelled'].includes(s.status)).length + (state.assessmentInstances.length ? state.assessmentInstances : state.labAssessmentItems).filter(i=>i.responsible_faculty===f.id && !['completed','cancelled','marks_uploaded'].includes(i.status)).length;
+      return {...f,theory,ct,sessional,total:theory+ct+sessional};
     }).sort((a,b)=>b.total-a.total);
-    return `<div class="page-head"><div><p class="eyebrow">Faculty Workload</p><h2>Workload View</h2><p>Counts current unfinished ownership across theory tasks, CTs, and lab activities.</p></div></div><section class="panel"><div class="table-wrap"><table class="table"><thead><tr><th>Faculty</th><th>Theory</th><th>CT</th><th>Lab</th><th>Total</th></tr></thead><tbody>${rows.map(r=>`<tr><td><b>${esc(r.full_name)}</b><br><span style="color:var(--ink-soft)">${esc(r.designation || '')}</span></td><td>${r.theory}</td><td>${r.ct}</td><td>${r.lab}</td><td><b>${r.total}</b></td></tr>`).join('')}</tbody></table></div></section>`;
+    return `<div class="page-head"><div><p class="eyebrow">Faculty Workload</p><h2>Workload View</h2><p>Counts current unfinished ownership across theory tasks, CTs, and sessional activities.</p></div></div><section class="panel"><div class="table-wrap"><table class="table"><thead><tr><th>Faculty</th><th>Theory</th><th>CT</th><th>Sessional</th><th>Total</th></tr></thead><tbody>${rows.map(r=>`<tr><td><b>${esc(r.full_name)}</b><br><span style="color:var(--ink-soft)">${esc(r.designation || '')}</span></td><td>${r.theory}</td><td>${r.ct}</td><td>${r.sessional}</td><td><b>${r.total}</b></td></tr>`).join('')}</tbody></table></div></section>`;
   }
 
   function renderSetupCentre(){
     if(!isAdmin()) return '<div class="empty">Administrator permission required.</div>';
     const inferred=state.courses.filter(c=>!c.course_type).length;
-    const labsNeed=labCourses().filter(c=>(labConfigFor(c.id).config_status || 'setup_required') !== 'configured').length;
-    return `<div class="page-head"><div><p class="eyebrow">Setup Centre</p><h2>Term and Course Setup</h2><p>Administrative readiness checks for the active term, course type, CT setup, and lab configuration.</p></div></div>
-      <div class="setup-grid"><div class="setup-card"><b>Academic term</b><span>${esc(activeTerm().name)} | Week ${esc(activeTerm().latest_completed_week)} of ${esc(activeTerm().total_teaching_weeks)}</span></div><div class="setup-card"><b>Explicit course type</b><span>${inferred ? `${inferred} inferred from odd/even code` : 'All courses have explicit type'}</span></div><div class="setup-card"><b>Lab configuration</b><span>${labsNeed ? `${labsNeed} lab course(s) need setup` : 'All lab courses configured'}</span></div><div class="setup-card"><b>Class tests</b><span>${state.classTests.length} CT records in active term</span></div></div>
-      <section class="panel"><div class="panel-title"><h3>Course Readiness</h3><span class="meta">ADMIN REVIEW</span></div><div class="table-wrap"><table class="table"><thead><tr><th>Course</th><th>Type</th><th>Setup</th><th>Health</th></tr></thead><tbody>${state.courses.map(c=>`<tr><td><b>${esc(c.course_code)}</b><br>${esc(c.title)}</td><td>${typeBadge(c)}</td><td>${isLabCourse(c)?statusBadge(labConfigFor(c.id).config_status || 'setup_required',LAB_STATUS_LABEL):statusBadge(c.status==='published'?'completed':'waiting')}</td><td>${esc(courseHealth(c).label)}</td></tr>`).join('')}</tbody></table></div></section>`;
+    const sessionalNeed=labCourses().filter(c=>(labConfigFor(c.id).config_status || 'setup_required') !== 'configured').length;
+    const outlineMissing=state.courseOutlines.filter(o=>o.status!=='shared_with_students').length || Math.max(state.courses.length-state.courseOutlines.length,0);
+    const warnings=setupWarnings();
+    return `<div class="page-head"><div><p class="eyebrow">Setup Centre</p><h2>Term and Course Setup</h2><p>Administrative readiness checks for the active term, course type, sections, CTs, outlines, feedback, CAR, and sessional configuration.</p></div></div>
+      <div class="setup-grid"><div class="setup-card"><b>Academic term</b><span>${esc(activeTerm().name)} | Week ${esc(activeTerm().latest_completed_week)} of ${esc(activeTerm().total_teaching_weeks)}</span></div><div class="setup-card"><b>Explicit course type</b><span>${inferred ? `${inferred} inferred from odd/even code` : 'All courses have explicit type'}</span></div><div class="setup-card"><b>Sessional setup</b><span>${sessionalNeed ? `${sessionalNeed} sessional course(s) need setup` : 'All sessional courses configured'}</span></div><div class="setup-card"><b>Outline sharing</b><span>${outlineMissing ? `${outlineMissing} outline record(s) need attention` : 'All outlines shared'}</span></div></div>
+      <section class="panel"><div class="panel-title"><h3>Smart Warnings</h3><span class="meta">${warnings.length} SIGNALS</span></div>${warnings.map(x=>conflictBox(x,true)).join('') || '<div class="empty">No setup warnings detected.</div>'}</section>
+      <section class="panel"><div class="panel-title"><h3>Course Readiness</h3><span class="meta">ADMIN REVIEW</span></div><div class="table-wrap"><table class="table"><thead><tr><th>Course</th><th>Type</th><th>Sections</th><th>Setup</th><th>Health</th></tr></thead><tbody>${state.courses.map(c=>`<tr><td><b>${esc(c.course_code)}</b><br>${esc(c.title)}</td><td>${typeBadge(c)}</td><td>${esc(sectionsFor(c.id).join(', ') || 'X')}</td><td>${isSessionalCourse(c)?statusBadge(labConfigFor(c.id).config_status || 'setup_required',SESSIONAL_STATUS_LABEL):statusBadge(c.status==='published'?'completed':'waiting')}</td><td>${esc(courseHealth(c).label)}</td></tr>`).join('')}</tbody></table></div></section>`;
   }
 
   function renderNotifications(){
     const items=notificationItems();
-    return `<div class="page-head"><div><p class="eyebrow">Action Signals</p><h2>Notifications</h2><p>Generated from assignments, deadlines, week changes, CT changes, and lab activities.</p></div></div><section class="panel"><div class="panel-title"><h3>Current Notifications</h3><span class="meta">${items.length} ACTIVE</span></div><div class="stack">${items.length?items.map(n=>`<article class="task-card" ${n.courseId?`data-open-course="${esc(n.courseId)}"`:''}><div class="task-top"><div><div class="task-role">${esc(n.title)}</div><div class="task-title">${esc(n.detail)}</div></div>${statusBadge(n.level)}</div></article>`).join(''):'<div class="empty">Nothing currently needs a notification.</div>'}</div></section>`;
+    return `<div class="page-head"><div><p class="eyebrow">Action Signals</p><h2>Notifications</h2><p>Generated from assignments, deadlines, week changes, CT changes, and sessional activities.</p></div></div><section class="panel"><div class="panel-title"><h3>Current Notifications</h3><span class="meta">${items.length} ACTIVE</span></div><div class="stack">${items.length?items.map(n=>`<article class="task-card" ${n.courseId?`data-open-course="${esc(n.courseId)}"`:''}><div class="task-top"><div><div class="task-role">${esc(n.title)}</div><div class="task-title">${esc(n.detail)}</div></div>${statusBadge(n.level)}</div></article>`).join(''):'<div class="empty">Nothing currently needs a notification.</div>'}</div></section>`;
   }
 
   function renderConflicts(){
@@ -548,25 +632,25 @@
   }
 
   function actionCard(item){
-    return `<article class="task-card" data-open-course="${esc(item.courseId)}"><div class="task-top"><div><div class="task-course">${esc(item.kind)}</div><div class="task-role">${esc(item.title)}</div><div class="task-title">${esc(item.detail)}</div></div>${statusBadge(item.status, {...STATUS_LABEL,...CT_STATUS_LABEL,...LAB_STATUS_LABEL})}</div><div class="task-foot"><span>${item.date?`Due ${fmtDate(item.date)}`:'No date set'}</span><span>Academic Week ${esc(item.week || '-')}</span></div></article>`;
+    return `<article class="task-card" data-open-course="${esc(item.courseId)}"><div class="task-top"><div><div class="task-course">${esc(item.kind)}</div><div class="task-role">${esc(item.title)}</div><div class="task-title">${esc(item.detail)}</div></div>${statusBadge(item.status, {...STATUS_LABEL,...CT_STATUS_LABEL,...SESSIONAL_STATUS_LABEL,...OUTLINE_STATUS_LABEL})}</div><div class="task-foot"><span>${item.date?`Due ${fmtDate(item.date)}`:'No date set'}</span><span>Academic Week ${esc(item.week || '-')}</span></div></article>`;
   }
   function unifiedTaskCard(t){
     const canEdit=t.kind==='Theory' && (state.demo || t.assignee===profileFacultyId() || isAdmin());
     const options=['not_started','in_progress','submitted','completed'].map(s=>`<option value="${s}" ${(statusRow(t.course.id,t.raw.key)?.status||'not_started')===s?'selected':''}>${STATUS_LABEL[s]}</option>`).join('');
-    return `<article class="task-card" data-open-course="${esc(t.course.id)}"><div class="task-top"><div><div class="task-course">${esc(t.kind)} | ${esc(t.course.course_code || '')}</div><div class="task-role">${esc(t.title)}</div><div class="task-title">${esc(t.course.title || '')}</div></div>${statusBadge(t.status,{...STATUS_LABEL,...CT_STATUS_LABEL,...LAB_STATUS_LABEL})}</div><div class="task-foot"><span>${t.date?`Due ${fmtDate(t.date)}`:'No date set'}</span>${canEdit?`<select class="select" data-status-change data-course="${esc(t.course.id)}" data-task="${esc(t.raw.key)}" onclick="event.stopPropagation()">${options}</select>`:`<span>${esc(facultyName(t.assignee))}</span>`}</div></article>`;
+    return `<article class="task-card" data-open-course="${esc(t.course.id)}"><div class="task-top"><div><div class="task-course">${esc(t.kind)} | ${esc(t.course.course_code || '')}</div><div class="task-role">${esc(t.title)}</div><div class="task-title">${esc(t.course.title || '')}</div></div>${statusBadge(t.status,{...STATUS_LABEL,...CT_STATUS_LABEL,...SESSIONAL_STATUS_LABEL,...OUTLINE_STATUS_LABEL})}</div><div class="task-foot"><span>${t.date?`Due ${fmtDate(t.date)}`:'No date set'}</span>${canEdit?`<select class="select" data-status-change data-course="${esc(t.course.id)}" data-task="${esc(t.raw.key)}" onclick="event.stopPropagation()">${options}</select>`:`<span>${esc(facultyName(t.assignee))}</span>`}</div></article>`;
   }
   function ctCard(ct){
     const c=courseById(ct.course_id);
-    return `<article class="task-card" data-open-course="${esc(ct.course_id)}"><div class="task-top"><div><div class="task-course">Class Test | ${esc(c.course_code || '')}</div><div class="task-role">${esc(ct.title)} - Section ${esc(ct.section || 'All')}</div><div class="task-title">${esc(ct.syllabus || 'Syllabus not set')}</div></div>${statusBadge(ct.status,CT_STATUS_LABEL)}</div><div class="task-foot"><span>${fmtDate(ct.date)} ${esc(ct.time || '')}</span><span>${esc(facultyName(ct.responsible_faculty))}</span></div></article>`;
+    return `<article class="task-card" data-open-course="${esc(ct.course_id)}"><div class="task-top"><div><div class="task-course">Class Test | ${esc(c.course_code || '')}</div><div class="task-role">${esc(ct.title || `CT ${ct.ct_number || ''}`)} - Section ${esc(ct.section || 'All')}</div><div class="task-title">${esc(ct.syllabus || (ctDate(ct) ? 'Syllabus not set' : 'Status exists but no CT date has been recorded.'))}</div></div>${statusBadge(ct.status || 'not_planned',CT_STATUS_LABEL)}</div><div class="task-foot"><span>${ctDate(ct)?`${fmtDate(ctDate(ct))} ${esc(ctTime(ct))}`:'Date missing'}</span><span>${esc(facultyName(ct.responsible_faculty || ct.responsible_faculty_id))}</span></div></article>`;
   }
   function labSmallCard(item){
-    const isSession='session_no' in item, c=courseById(item.course_id), date=item.date || item.due_date;
-    const title=isSession ? `Lab ${item.session_no} - ${item.title}` : item.title;
+    const isSession='session_no' in item, c=courseById(item.course_id), date=item.date || item.due_date || item.scheduled_date;
+    const title=isSession ? `Session ${item.session_no || item.sequence_number || ''} - ${item.title}` : item.title;
     const responsible=isSession ? item.assigned_faculty : item.responsible_faculty;
-    return `<article class="task-card" data-open-course="${esc(item.course_id)}"><div class="task-top"><div><div class="task-course">${isSession?'Lab Session':'Lab Assessment'} | ${esc(c.course_code || '')}</div><div class="task-role">${esc(title)}</div><div class="task-title">${esc(isSession ? `${item.section || 'All'} ${item.group_label || ''}` : `${item.marks || 0} marks`)}</div></div>${statusBadge(item.status,LAB_STATUS_LABEL)}</div><div class="task-foot"><span>${fmtDate(date)}</span><span>${esc(facultyName(responsible))}</span></div></article>`;
+    return `<article class="task-card" data-open-course="${esc(item.course_id)}"><div class="task-top"><div><div class="task-course">${isSession?'Sessional Session':'Sessional Assessment'} | ${esc(c.course_code || '')}</div><div class="task-role">${esc(title)}</div><div class="task-title">${esc(isSession ? `${item.section || item.scope || 'Entire Course'} ${item.group_label || ''}` : `${item.marks || item.marks_each || 0} marks`)}</div></div>${statusBadge(item.status,SESSIONAL_STATUS_LABEL)}</div><div class="task-foot"><span>${fmtDate(date)}</span><span>${esc(facultyName(responsible))}</span></div></article>`;
   }
   function eventCard(e){
-    return `<article class="event-row" data-open-course="${esc(e.courseId)}"><div class="event-date"><b>${fmtDate(e.date)}</b><span>${esc(e.time || `Week ${e.week || '-'}`)}</span></div><div><div class="task-course">${esc(e.type)} | ${esc(e.course?.course_code || '')}</div><div class="task-role">${esc(e.title)}</div><div class="task-title">${esc(e.detail)}</div></div>${statusBadge(e.status,{...STATUS_LABEL,...CT_STATUS_LABEL,...LAB_STATUS_LABEL})}</article>`;
+    return `<article class="event-row" data-open-course="${esc(e.courseId)}"><div class="event-date"><b>${fmtDate(e.date)}</b><span>${esc(e.time || `Week ${e.week || '-'}`)}</span></div><div><div class="task-course">${esc(e.type)} | ${esc(e.course?.course_code || '')}</div><div class="task-role">${esc(e.title)}</div><div class="task-title">${esc(e.detail)}</div></div>${statusBadge(e.status,{...STATUS_LABEL,...CT_STATUS_LABEL,...SESSIONAL_STATUS_LABEL,...OUTLINE_STATUS_LABEL})}</article>`;
   }
   function changeCard(item){
     return `<article class="task-card"><div class="task-top"><div><div class="task-course">${esc(item.kind)}</div><div class="task-role">${esc(item.title)}</div><div class="task-title">${esc(item.detail)}</div></div>${statusBadge(item.level)}</div></article>`;
@@ -594,6 +678,13 @@
     const a=assignmentFor(c.id);
     return `<tr><td><b>${esc(c.course_code)}</b><br><span style="color:var(--ink-soft)">${esc(c.title)}</span><br>${typeBadge(c)} ${statusBadge(c.status==='published'?'completed':'waiting')}</td><td>${esc(facultyName(a.preparer_a))}</td><td>${esc(facultyName(a.preparer_b))}</td><td>${esc(facultyName(a.moderator_1))}</td><td>${esc(facultyName(a.moderator_2))}</td><td>${esc(facultyName(a.scrutinizer))}</td><td><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn small" data-edit-course="${esc(c.id)}">Edit</button><button class="btn small ${c.status==='published'?'danger':'accent'}" data-publish-course="${esc(c.id)}">${c.status==='published'?'Unpublish':'Publish'}</button></div></td></tr>`;
   }
+  function sectionsFor(courseId){
+    const sections=state.courseSections.filter(s=>s.course_id===courseId).map(s=>s.section_code).filter(Boolean);
+    if(sections.length) return [...new Set(sections)];
+    const c=courseById(courseId);
+    if(isSessionalCourse(c)) return [c.section_a || 'A1', c.section_b || 'A2'].filter(Boolean);
+    return [c.section_a || 'X'].filter(Boolean);
+  }
 
   function courseProgress(c){
     if(isTheoryCourse(c)) return progressPct(TASKS.map(t=>({status:statusFor(c,t.key)})));
@@ -603,24 +694,57 @@
   function courseHealth(c){
     const events=eventsForAll().filter(e=>e.courseId===c.id);
     const config=labConfigFor(c.id);
-    if(isLabCourse(c) && (config.config_status || 'setup_required') !== 'configured') return {label:'Attention', status:'waiting', tone:'yellow'};
-    if(events.some(e=>e.date < todayIso() && !['completed','conducted','cancelled'].includes(e.status))) return {label:'At Risk', status:'overdue', tone:'red'};
+    if(isSessionalCourse(c) && (config.config_status || 'setup_required') !== 'configured') return {label:'Attention', status:'waiting', tone:'yellow'};
+    if(events.some(e=>e.date < todayIso() && !['completed','conducted','marks_published','marks_uploaded','shared_with_students','uploaded','cancelled'].includes(e.status))) return {label:'At Risk', status:'overdue', tone:'red'};
     if(courseProgress(c)===100) return {label:'Completed', status:'completed', tone:'done'};
-    if(events.some(e=>daysFromToday(e.date)>=0 && daysFromToday(e.date)<=3 && !['completed','conducted','cancelled'].includes(e.status))) return {label:'Attention', status:'waiting', tone:'yellow'};
+    if(events.some(e=>daysFromToday(e.date)>=0 && daysFromToday(e.date)<=3 && !['completed','conducted','marks_published','marks_uploaded','shared_with_students','uploaded','cancelled'].includes(e.status))) return {label:'Attention', status:'waiting', tone:'yellow'};
     return {label:'On Track', status:'in_progress', tone:'green'};
+  }
+  function setupWarnings(){
+    const warnings=[];
+    for(const type of ['COURSE_OUTLINE_SHARING','QUESTION_SUBMISSION_DEADLINE','FEEDBACK_DEADLINE','CAR_DEADLINE']){
+      if(!milestoneDate(type)) warnings.push({title:`${milestoneLabel(type)} not configured`,detail:'This should be a term-level milestone, not repeated manually for every course.'});
+    }
+    for(const c of state.courses){
+      if(!sectionsFor(c.id).length) warnings.push({title:`${c.course_code}: sections missing`,detail:'Theory normally uses X; sessional courses commonly use A1/A2; thesis may also use X.'});
+      const outline=state.courseOutlines.find(o=>o.course_id===c.id);
+      if(!outline || outline.status!=='shared_with_students') warnings.push({title:`${c.course_code}: course outline not shared`,detail:`Current status: ${OUTLINE_STATUS_LABEL[outline?.status || 'not_started']}.`});
+      if(isSessionalCourse(c) && (sessionalConfigFor(c.id).config_status || 'setup_required') !== 'configured') warnings.push({title:`${c.course_code}: sessional assessment structure not configured`,detail:'Configure components, quantities, scope, and session count before full tracking.'});
+    }
+    for(const ct of state.classTests){
+      if((ct.status && ct.status!=='not_planned') && !ctDate(ct)) warnings.push({title:`${courseById(ct.course_id).course_code || ''}: ${ct.title || `CT ${ct.ct_number || ''}`} has status but no date`,detail:'Migrated CT records may be incomplete, but they should remain visible for cleanup.'});
+    }
+    for(const i of (state.assessmentInstances.length ? state.assessmentInstances : state.labAssessmentItems)){
+      if((i.due_date || i.scheduled_date) && !i.title) warnings.push({title:`${courseById(i.course_id).course_code || ''}: assessment date exists without type`,detail:'Do not silently discard partially-filled workbook triplets.'});
+      if(i.title && !i.due_date && !i.scheduled_date) warnings.push({title:`${courseById(i.course_id).course_code || ''}: ${i.title} has incomplete scheduling`,detail:'Assessment type exists but scheduling details are incomplete.'});
+    }
+    return warnings;
   }
   function attentionItems(){
     const items=[];
+    for(const o of state.courseOutlines.filter(o=>o.status!=='shared_with_students')){
+      const c=courseById(o.course_id), date=o.due_date || milestoneDate('COURSE_OUTLINE_SHARING');
+      if(courseIsMine(c) && daysFromToday(date)<=10) items.push({kind:'Course Outline', title:`${c.course_code || ''} - Course outline`, detail:OUTLINE_STATUS_LABEL[o.status || 'not_started'], date, week:weekForDate(date), status:o.status || 'not_started', courseId:o.course_id, rank:daysFromToday(date)<0?0:2});
+    }
     for(const t of myTheoryTasks()){
       if(t.status==='completed') continue;
       if(t.status==='overdue' || (t.due_date && daysFromToday(t.due_date)<=7)) items.push({kind:'Theory', title:`${t.course.course_code} - ${t.label}`, detail:t.status==='waiting'?'Waiting for prerequisite completion.':`Responsible: ${facultyName(t.assignee_id)}`, date:t.due_date, week:weekForDate(t.due_date), status:t.status, courseId:t.course.id, rank:t.status==='overdue'?0:2});
     }
-    for(const ct of myClassTests().filter(ct=>!['completed','cancelled'].includes(ct.status))){
-      if(daysFromToday(ct.date)<=10) items.push({kind:'Class Test', title:`${courseById(ct.course_id).course_code || ''} - ${ct.title}`, detail:`${ct.section || 'All'} | ${ct.syllabus || 'Syllabus not set'}`, date:ct.date, week:weekForDate(ct.date), status:ct.status, courseId:ct.course_id, rank:daysFromToday(ct.date)<0?0:1});
+    for(const ct of myClassTests().filter(ct=>!['completed','marks_published','cancelled'].includes(ct.status))){
+      const date=ctDate(ct);
+      if(!date || daysFromToday(date)<=10) items.push({kind:'Class Test', title:`${courseById(ct.course_id).course_code || ''} - ${ct.title || `CT ${ct.ct_number || ''}`}`, detail:date ? `${ct.section || 'All'} | ${ct.syllabus || 'Syllabus not set'}` : 'CT status exists but no CT date has been recorded.', date, week:weekForDate(date), status:ct.status || 'not_planned', courseId:ct.course_id, rank:!date?0:daysFromToday(date)<0?0:1});
     }
     for(const i of [...myLabSessions(),...myLabItems()].filter(x=>!['completed','cancelled'].includes(x.status))){
-      const date=i.date || i.due_date;
-      if(daysFromToday(date)<=10) items.push({kind:'Lab', title:`${courseById(i.course_id).course_code || ''} - ${'session_no' in i ? `Lab ${i.session_no}` : i.title}`, detail:'assigned_faculty' in i ? i.title : `${i.marks || 0} marks`, date, week:weekForDate(date), status:i.status, courseId:i.course_id, rank:daysFromToday(date)<0?0:2});
+      const date=i.date || i.due_date || i.scheduled_date;
+      if(daysFromToday(date)<=10) items.push({kind:'Sessional', title:`${courseById(i.course_id).course_code || ''} - ${'session_no' in i ? `Session ${i.session_no}` : i.title}`, detail:'assigned_faculty' in i ? i.title : `${i.marks || i.marks_each || 0} marks`, date, week:weekForDate(date), status:i.status, courseId:i.course_id, rank:daysFromToday(date)<0?0:2});
+    }
+    for(const f of state.feedbackStatuses.filter(f=>f.status!=='completed')){
+      const c=courseById(f.course_id), date=f.deadline || milestoneDate('FEEDBACK_DEADLINE');
+      if(courseIsMine(c) && daysFromToday(date)<=10) items.push({kind:'Feedback', title:`${c.course_code || ''} - Student feedback`, detail:f.notes || 'Feedback workflow not complete.', date, week:weekForDate(date), status:f.status || 'not_started', courseId:f.course_id, rank:daysFromToday(date)<0?0:3});
+    }
+    for(const cf of state.courseFileStatuses.filter(cf=>!['uploaded','completed'].includes(cf.status))){
+      const c=courseById(cf.course_id), date=cf.deadline || milestoneDate('CAR_DEADLINE');
+      if(courseIsMine(c) && daysFromToday(date)<=10) items.push({kind:'Course File / CAR', title:`${c.course_code || ''} - Course File / CAR`, detail:cf.notes || 'Course archive not complete.', date, week:weekForDate(date), status:cf.status || 'not_started', courseId:cf.course_id, rank:daysFromToday(date)<0?0:3});
     }
     return items.sort((a,b)=>a.rank-b.rank || (a.date || '').localeCompare(b.date || ''));
   }
@@ -640,8 +764,8 @@
   function findCtConflicts(){
     const seen={}, conflicts=[];
     for(const ct of state.classTests.filter(x=>!['cancelled','postponed'].includes(x.status))){
-      const key=[ct.batch || courseById(ct.course_id).batch || '',ct.section || '',ct.date || '',ct.time || ''].join('|');
-      if(seen[key]) conflicts.push({title:`${ct.batch || ''} Section ${ct.section || 'All'} has overlapping CTs`,detail:`${courseById(seen[key].course_id).course_code || ''} ${seen[key].title} and ${courseById(ct.course_id).course_code || ''} ${ct.title} share ${fmtDate(ct.date)} ${ct.time || ''}.`});
+      const key=[ct.batch || courseById(ct.course_id).batch || '',ct.section || '',ctDate(ct) || '',ctTime(ct)].join('|');
+      if(seen[key] && ctDate(ct)) conflicts.push({title:`${ct.batch || ''} Section ${ct.section || 'All'} has overlapping CTs`,detail:`${courseById(seen[key].course_id).course_code || ''} ${seen[key].title} and ${courseById(ct.course_id).course_code || ''} ${ct.title} share ${fmtDate(ctDate(ct))} ${ctTime(ct)}.`});
       else seen[key]=ct;
     }
     return conflicts;
@@ -659,7 +783,8 @@
       if(c.question_deadline&&c.exam_date&&c.question_deadline>c.exam_date) errors.push({title:`${p}: invalid deadline order`,detail:'Question submission deadline occurs after the exam date.'});
       if(c.exam_date&&c.final_gradesheet_deadline&&c.exam_date>c.final_gradesheet_deadline) errors.push({title:`${p}: invalid deadline order`,detail:'Final gradesheet deadline occurs before the exam date.'});
     }
-    for(const c of labCourses()) if((labConfigFor(c.id).config_status || 'setup_required') !== 'configured') warnings.push({title:`${c.course_code}: lab configuration pending`,detail:'Lab courses need session count and assessment components before full tracking.'});
+    for(const c of labCourses()) if((labConfigFor(c.id).config_status || 'setup_required') !== 'configured') warnings.push({title:`${c.course_code}: sessional configuration pending`,detail:'Sessional courses need session count and assessment components before full tracking.'});
+    setupWarnings().forEach(x=>warnings.push(x));
     findCtConflicts().forEach(x=>warnings.push(x));
     const load={};taskObjects().forEach(t=>{if(t.assignee_id)load[t.assignee_id]=(load[t.assignee_id]||0)+1;});Object.entries(load).filter(([,n])=>n>=12).forEach(([id,n])=>warnings.push({title:`High workload: ${facultyName(id)}`,detail:`${n} theory workflow responsibilities are currently assigned.`}));
     return {errors,warnings};

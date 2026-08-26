@@ -62,10 +62,14 @@ create table if not exists public.academic_weeks (
   week_no integer not null check(week_no > 0),
   starts_on date,
   ends_on date,
+  status text,
+  notes text not null default '',
   label text,
   unique(term_id, week_no),
   check (starts_on is null or ends_on is null or starts_on <= ends_on)
 );
+alter table public.academic_weeks add column if not exists status text;
+alter table public.academic_weeks add column if not exists notes text not null default '';
 
 create table if not exists public.courses (
   id uuid primary key default gen_random_uuid(),
@@ -85,31 +89,68 @@ create table if not exists public.courses (
 
 alter table public.courses add column if not exists term_id uuid references public.academic_terms(id) on delete set null;
 alter table public.courses add column if not exists course_type text not null default 'theory';
+alter table public.courses add column if not exists sessional_subtype text;
+alter table public.courses add column if not exists contact_hours numeric;
 alter table public.courses add column if not exists batch text;
 alter table public.courses add column if not exists section_a text not null default 'A';
 alter table public.courses add column if not exists section_b text not null default 'B';
 do $$
 begin
-  if not exists (
-    select 1 from pg_constraint
-    where conname='courses_course_type_check'
-      and conrelid='public.courses'::regclass
-  ) then
-    alter table public.courses
-      add constraint courses_course_type_check
-      check (course_type in ('theory','lab'));
-  end if;
+  alter table public.courses drop constraint if exists courses_course_type_check;
+  alter table public.courses
+    add constraint courses_course_type_check
+    check (course_type in ('theory','sessional','lab','THEORY','SESSIONAL'));
+  alter table public.courses drop constraint if exists courses_sessional_subtype_check;
+  alter table public.courses
+    add constraint courses_sessional_subtype_check
+    check (sessional_subtype is null or sessional_subtype in ('LABORATORY','DESIGN','THESIS','PROJECT','OTHER'));
 end $$;
+
+create table if not exists public.course_sections (
+  id uuid primary key default gen_random_uuid(),
+  course_id uuid not null references public.courses(id) on delete cascade,
+  section_code text not null,
+  created_at timestamptz not null default now(),
+  unique(course_id, section_code)
+);
 
 create table if not exists public.course_faculty (
   id uuid primary key default gen_random_uuid(),
   course_id uuid not null references public.courses(id) on delete cascade,
+  section_id uuid references public.course_sections(id) on delete cascade,
   faculty_id uuid not null references public.faculty(id) on delete restrict,
   role text not null default 'course_teacher',
   section text,
+  display_order integer not null default 1,
   created_at timestamptz not null default now()
 );
-create unique index if not exists course_faculty_unique_role on public.course_faculty(course_id, faculty_id, role, coalesce(section,''));
+alter table public.course_faculty add column if not exists section_id uuid references public.course_sections(id) on delete cascade;
+alter table public.course_faculty add column if not exists display_order integer not null default 1;
+drop index if exists public.course_faculty_unique_role;
+create unique index if not exists course_faculty_unique_role on public.course_faculty(course_id, coalesce(section_id,'00000000-0000-0000-0000-000000000000'::uuid), faculty_id, role, coalesce(section,''));
+
+create table if not exists public.term_milestones (
+  id uuid primary key default gen_random_uuid(),
+  term_id uuid not null references public.academic_terms(id) on delete cascade,
+  course_id uuid references public.courses(id) on delete cascade,
+  milestone_type text not null check(milestone_type in ('COURSE_OUTLINE_SHARING','QUESTION_SUBMISSION_DEADLINE','FEEDBACK_START','FEEDBACK_DEADLINE','THEORY_GRADESHEET_DEADLINE','SESSIONAL_GRADESHEET_DEADLINE','CAR_DEADLINE','OTHER')),
+  milestone_date date not null,
+  status text not null default 'scheduled',
+  faculty_id uuid references public.faculty(id) on delete set null,
+  notes text not null default '',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.course_outline_statuses (
+  course_id uuid primary key references public.courses(id) on delete cascade,
+  term_id uuid references public.academic_terms(id) on delete set null,
+  status text not null default 'not_started' check(status in ('not_started','under_preparation','prepared','shared_with_students')),
+  due_date date,
+  responsible_faculty uuid references public.faculty(id) on delete set null,
+  notes text not null default '',
+  updated_at timestamptz not null default now()
+);
 
 create table if not exists public.primary_assignments (
   course_id uuid primary key references public.courses(id) on delete cascade,
@@ -150,19 +191,36 @@ create table if not exists public.class_tests (
   id uuid primary key default gen_random_uuid(),
   course_id uuid not null references public.courses(id) on delete cascade,
   term_id uuid references public.academic_terms(id) on delete set null,
+  ct_number integer,
   title text not null,
   section text,
   batch text,
-  date date not null,
+  date date,
   time time,
+  scheduled_date date,
+  scheduled_time time,
   syllabus text not null default '',
   responsible_faculty uuid references public.faculty(id) on delete set null,
-  status text not null default 'proposed' check(status in ('proposed','confirmed','completed','postponed','rescheduled','cancelled')),
+  responsible_faculty_id uuid references public.faculty(id) on delete set null,
+  status text not null default 'not_planned',
   notes text not null default '',
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
-create index if not exists class_tests_schedule_idx on public.class_tests(batch, section, date, time);
+alter table public.class_tests add column if not exists ct_number integer;
+alter table public.class_tests add column if not exists scheduled_date date;
+alter table public.class_tests add column if not exists scheduled_time time;
+alter table public.class_tests add column if not exists responsible_faculty_id uuid references public.faculty(id) on delete set null;
+alter table public.class_tests alter column date drop not null;
+do $$
+begin
+  alter table public.class_tests drop constraint if exists class_tests_status_check;
+  alter table public.class_tests
+    add constraint class_tests_status_check
+    check(status in ('not_planned','scheduled','ct_taken','scripts_under_examination','scripts_checked','marks_published','proposed','confirmed','completed','postponed','rescheduled','cancelled'));
+end $$;
+drop index if exists public.class_tests_schedule_idx;
+create index if not exists class_tests_schedule_idx on public.class_tests(batch, section, coalesce(scheduled_date,date), coalesce(scheduled_time,time));
 
 create table if not exists public.class_test_history (
   id bigint generated always as identity primary key,
@@ -245,6 +303,126 @@ create table if not exists public.lab_activity_assignments (
   role text not null default 'responsible',
   created_at timestamptz not null default now(),
   check (lab_session_id is not null or assessment_item_id is not null)
+);
+
+create table if not exists public.sessional_course_configs (
+  id uuid primary key default gen_random_uuid(),
+  course_id uuid not null unique references public.courses(id) on delete cascade,
+  term_id uuid references public.academic_terms(id) on delete set null,
+  session_count integer not null default 0 check(session_count >= 0),
+  config_status text not null default 'setup_required' check(config_status in ('setup_required','configured')),
+  version integer not null default 1 check(version > 0),
+  remarks text not null default '',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.sessional_sessions (
+  id uuid primary key default gen_random_uuid(),
+  course_id uuid not null references public.courses(id) on delete cascade,
+  term_id uuid references public.academic_terms(id) on delete set null,
+  session_no integer not null check(session_no > 0),
+  title text not null,
+  date date,
+  scheduled_time time,
+  section_id uuid references public.course_sections(id) on delete set null,
+  section text,
+  scope text not null default 'Entire Course',
+  group_label text,
+  assigned_faculty uuid references public.faculty(id) on delete set null,
+  status text not null default 'not_started' check(status in ('not_started','scheduled','in_progress','conducted','submission_pending','evaluation_pending','completed','cancelled')),
+  report_required boolean not null default false,
+  report_deadline date,
+  notes text not null default '',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+drop index if exists public.sessional_sessions_unique_slot;
+create unique index if not exists sessional_sessions_unique_slot on public.sessional_sessions(course_id, session_no, coalesce(section_id,'00000000-0000-0000-0000-000000000000'::uuid), coalesce(section,''), coalesce(group_label,''));
+
+create table if not exists public.assessment_components (
+  id uuid primary key default gen_random_uuid(),
+  course_id uuid not null references public.courses(id) on delete cascade,
+  name text not null,
+  quantity integer not null default 1 check(quantity > 0),
+  marks_each numeric not null default 0,
+  counted_quantity integer,
+  scope text not null default 'Entire Course',
+  display_order integer not null default 1,
+  active boolean not null default true,
+  due_behavior text not null default 'scheduled',
+  responsible_faculty uuid references public.faculty(id) on delete set null,
+  remarks text not null default '',
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.assessment_instances (
+  id uuid primary key default gen_random_uuid(),
+  component_id uuid references public.assessment_components(id) on delete cascade,
+  course_id uuid not null references public.courses(id) on delete cascade,
+  sequence_number integer,
+  title text,
+  section_id uuid references public.course_sections(id) on delete set null,
+  scope text not null default 'Entire Course',
+  sessional_session_id uuid references public.sessional_sessions(id) on delete set null,
+  scheduled_date date,
+  due_date date,
+  status text not null default 'scheduled' check(status in ('not_started','scheduled','evaluation_taken','marking_complete','marks_uploaded','completed','cancelled','in_progress','conducted','submission_pending','evaluation_pending')),
+  responsible_faculty uuid references public.faculty(id) on delete set null,
+  notes text not null default '',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.sessional_grade_assignments (
+  course_id uuid primary key references public.courses(id) on delete cascade,
+  preparer uuid references public.faculty(id) on delete restrict,
+  scrutinizer uuid references public.faculty(id) on delete restrict,
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.sessional_grade_statuses (
+  course_id uuid not null references public.courses(id) on delete cascade,
+  task_key text not null default 'sessional_gradesheet_prep',
+  status text not null default 'not_started' check(status in ('not_started','in_progress','submitted','completed','blocked','overdue')),
+  due_date date,
+  responsible_faculty uuid references public.faculty(id) on delete set null,
+  completed_at timestamptz,
+  updated_by uuid references auth.users(id) on delete set null,
+  updated_at timestamptz not null default now(),
+  primary key(course_id, task_key)
+);
+
+create table if not exists public.feedback_statuses (
+  course_id uuid primary key references public.courses(id) on delete cascade,
+  term_id uuid references public.academic_terms(id) on delete set null,
+  status text not null default 'not_started' check(status in ('not_started','in_progress','completed','blocked')),
+  deadline date,
+  responsible_faculty uuid references public.faculty(id) on delete set null,
+  notes text not null default '',
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.course_file_statuses (
+  course_id uuid primary key references public.courses(id) on delete cascade,
+  term_id uuid references public.academic_terms(id) on delete set null,
+  status text not null default 'not_started' check(status in ('not_started','in_progress','uploaded','completed','blocked')),
+  deadline date,
+  responsible_faculty uuid references public.faculty(id) on delete set null,
+  notes text not null default '',
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.import_validation_issues (
+  id bigint generated always as identity primary key,
+  term_id uuid references public.academic_terms(id) on delete cascade,
+  source_sheet text not null,
+  source_row integer,
+  issue_type text not null,
+  severity text not null default 'warning' check(severity in ('info','warning','error')),
+  message text not null,
+  resolved_at timestamptz,
+  created_at timestamptz not null default now()
 );
 
 create table if not exists public.academic_events (
@@ -486,6 +664,12 @@ drop trigger if exists audit_academic_weeks on public.academic_weeks;
 create trigger audit_academic_weeks after insert or update or delete on public.academic_weeks for each row execute function public.audit_row();
 drop trigger if exists audit_course_faculty on public.course_faculty;
 create trigger audit_course_faculty after insert or update or delete on public.course_faculty for each row execute function public.audit_row();
+drop trigger if exists audit_course_sections on public.course_sections;
+create trigger audit_course_sections after insert or update or delete on public.course_sections for each row execute function public.audit_row();
+drop trigger if exists audit_term_milestones on public.term_milestones;
+create trigger audit_term_milestones after insert or update or delete on public.term_milestones for each row execute function public.audit_row();
+drop trigger if exists audit_course_outline_statuses on public.course_outline_statuses;
+create trigger audit_course_outline_statuses after insert or update or delete on public.course_outline_statuses for each row execute function public.audit_row();
 drop trigger if exists audit_class_tests on public.class_tests;
 create trigger audit_class_tests after insert or update or delete on public.class_tests for each row execute function public.audit_row();
 drop trigger if exists audit_class_test_history on public.class_test_history;
@@ -502,6 +686,24 @@ drop trigger if exists audit_academic_events on public.academic_events;
 create trigger audit_academic_events after insert or update or delete on public.academic_events for each row execute function public.audit_row();
 drop trigger if exists audit_notifications on public.notifications;
 create trigger audit_notifications after insert or update or delete on public.notifications for each row execute function public.audit_row();
+drop trigger if exists audit_sessional_course_configs on public.sessional_course_configs;
+create trigger audit_sessional_course_configs after insert or update or delete on public.sessional_course_configs for each row execute function public.audit_row();
+drop trigger if exists audit_sessional_sessions on public.sessional_sessions;
+create trigger audit_sessional_sessions after insert or update or delete on public.sessional_sessions for each row execute function public.audit_row();
+drop trigger if exists audit_assessment_components on public.assessment_components;
+create trigger audit_assessment_components after insert or update or delete on public.assessment_components for each row execute function public.audit_row();
+drop trigger if exists audit_assessment_instances on public.assessment_instances;
+create trigger audit_assessment_instances after insert or update or delete on public.assessment_instances for each row execute function public.audit_row();
+drop trigger if exists audit_sessional_grade_assignments on public.sessional_grade_assignments;
+create trigger audit_sessional_grade_assignments after insert or update or delete on public.sessional_grade_assignments for each row execute function public.audit_row();
+drop trigger if exists audit_sessional_grade_statuses on public.sessional_grade_statuses;
+create trigger audit_sessional_grade_statuses after insert or update or delete on public.sessional_grade_statuses for each row execute function public.audit_row();
+drop trigger if exists audit_feedback_statuses on public.feedback_statuses;
+create trigger audit_feedback_statuses after insert or update or delete on public.feedback_statuses for each row execute function public.audit_row();
+drop trigger if exists audit_course_file_statuses on public.course_file_statuses;
+create trigger audit_course_file_statuses after insert or update or delete on public.course_file_statuses for each row execute function public.audit_row();
+drop trigger if exists audit_import_validation_issues on public.import_validation_issues;
+create trigger audit_import_validation_issues after insert or update or delete on public.import_validation_issues for each row execute function public.audit_row();
 
 alter table public.faculty enable row level security;
 alter table public.allowed_users enable row level security;
@@ -509,6 +711,7 @@ alter table public.profiles enable row level security;
 alter table public.academic_terms enable row level security;
 alter table public.academic_weeks enable row level security;
 alter table public.courses enable row level security;
+alter table public.course_sections enable row level security;
 alter table public.course_faculty enable row level security;
 alter table public.primary_assignments enable row level security;
 alter table public.task_statuses enable row level security;
@@ -522,6 +725,17 @@ alter table public.lab_assessment_items enable row level security;
 alter table public.lab_activity_assignments enable row level security;
 alter table public.academic_events enable row level security;
 alter table public.notifications enable row level security;
+alter table public.term_milestones enable row level security;
+alter table public.course_outline_statuses enable row level security;
+alter table public.sessional_course_configs enable row level security;
+alter table public.sessional_sessions enable row level security;
+alter table public.assessment_components enable row level security;
+alter table public.assessment_instances enable row level security;
+alter table public.sessional_grade_assignments enable row level security;
+alter table public.sessional_grade_statuses enable row level security;
+alter table public.feedback_statuses enable row level security;
+alter table public.course_file_statuses enable row level security;
+alter table public.import_validation_issues enable row level security;
 alter table public.audit_logs enable row level security;
 
 -- No public/anon policies: unauthorized visitors receive zero protected rows.
@@ -538,6 +752,12 @@ drop policy if exists courses_read on public.courses;
 drop policy if exists courses_admin_write on public.courses;
 drop policy if exists course_faculty_read on public.course_faculty;
 drop policy if exists course_faculty_admin_write on public.course_faculty;
+drop policy if exists course_sections_read on public.course_sections;
+drop policy if exists course_sections_admin_write on public.course_sections;
+drop policy if exists term_milestones_read on public.term_milestones;
+drop policy if exists term_milestones_admin_write on public.term_milestones;
+drop policy if exists course_outline_read on public.course_outline_statuses;
+drop policy if exists course_outline_write on public.course_outline_statuses;
 drop policy if exists assignments_read on public.primary_assignments;
 drop policy if exists assignments_admin_write on public.primary_assignments;
 drop policy if exists task_status_read on public.task_statuses;
@@ -563,6 +783,24 @@ drop policy if exists academic_events_read on public.academic_events;
 drop policy if exists academic_events_admin_write on public.academic_events;
 drop policy if exists notifications_read on public.notifications;
 drop policy if exists notifications_admin_write on public.notifications;
+drop policy if exists sessional_config_read on public.sessional_course_configs;
+drop policy if exists sessional_config_write on public.sessional_course_configs;
+drop policy if exists sessional_sessions_read on public.sessional_sessions;
+drop policy if exists sessional_sessions_write on public.sessional_sessions;
+drop policy if exists assessment_components_read on public.assessment_components;
+drop policy if exists assessment_components_write on public.assessment_components;
+drop policy if exists assessment_instances_read on public.assessment_instances;
+drop policy if exists assessment_instances_write on public.assessment_instances;
+drop policy if exists sessional_grade_assignments_read on public.sessional_grade_assignments;
+drop policy if exists sessional_grade_assignments_write on public.sessional_grade_assignments;
+drop policy if exists sessional_grade_statuses_read on public.sessional_grade_statuses;
+drop policy if exists sessional_grade_statuses_write on public.sessional_grade_statuses;
+drop policy if exists feedback_statuses_read on public.feedback_statuses;
+drop policy if exists feedback_statuses_write on public.feedback_statuses;
+drop policy if exists course_file_statuses_read on public.course_file_statuses;
+drop policy if exists course_file_statuses_write on public.course_file_statuses;
+drop policy if exists import_validation_issues_read on public.import_validation_issues;
+drop policy if exists import_validation_issues_write on public.import_validation_issues;
 drop policy if exists audit_admin_read on public.audit_logs;
 create policy faculty_read_authenticated on public.faculty for select using (public.has_active_profile());
 create policy faculty_admin_write on public.faculty for all using (public.is_admin()) with check (public.is_admin());
@@ -575,8 +813,18 @@ create policy weeks_read on public.academic_weeks for select using (public.has_a
 create policy weeks_admin_write on public.academic_weeks for all using (public.is_admin()) with check (public.is_admin());
 create policy courses_read on public.courses for select using (public.is_admin() or (public.has_active_profile() and active and status='published'));
 create policy courses_admin_write on public.courses for all using (public.is_admin()) with check (public.is_admin());
+create policy course_sections_read on public.course_sections for select using (public.can_access_course(course_id));
+create policy course_sections_admin_write on public.course_sections for all using (public.is_admin()) with check (public.is_admin());
 create policy course_faculty_read on public.course_faculty for select using (public.can_access_course(course_id));
 create policy course_faculty_admin_write on public.course_faculty for all using (public.is_admin()) with check (public.is_admin());
+create policy term_milestones_read on public.term_milestones for select using (public.has_active_profile() and (course_id is null or public.can_access_course(course_id)));
+create policy term_milestones_admin_write on public.term_milestones for all using (public.is_admin()) with check (public.is_admin());
+create policy course_outline_read on public.course_outline_statuses for select using (public.can_access_course(course_id));
+create policy course_outline_write on public.course_outline_statuses for all using (
+  public.is_admin() or exists(select 1 from public.course_faculty cf where cf.course_id=course_outline_statuses.course_id and cf.faculty_id=public.current_faculty_id())
+) with check (
+  public.is_admin() or exists(select 1 from public.course_faculty cf where cf.course_id=course_outline_statuses.course_id and cf.faculty_id=public.current_faculty_id())
+);
 create policy assignments_read on public.primary_assignments for select using (public.can_access_course(course_id));
 create policy assignments_admin_write on public.primary_assignments for all using (public.is_admin()) with check (public.is_admin());
 create policy task_status_read on public.task_statuses for select using (public.can_access_course(course_id));
@@ -606,6 +854,52 @@ create policy academic_events_read on public.academic_events for select using (c
 create policy academic_events_admin_write on public.academic_events for all using (public.is_admin()) with check (public.is_admin());
 create policy notifications_read on public.notifications for select using (public.is_admin() or faculty_id is null or faculty_id=public.current_faculty_id());
 create policy notifications_admin_write on public.notifications for all using (public.is_admin()) with check (public.is_admin());
+create policy sessional_config_read on public.sessional_course_configs for select using (public.can_access_course(course_id));
+create policy sessional_config_write on public.sessional_course_configs for all using (
+  public.is_admin() or exists(select 1 from public.course_faculty cf where cf.course_id=sessional_course_configs.course_id and cf.faculty_id=public.current_faculty_id())
+) with check (
+  public.is_admin() or exists(select 1 from public.course_faculty cf where cf.course_id=sessional_course_configs.course_id and cf.faculty_id=public.current_faculty_id())
+);
+create policy sessional_sessions_read on public.sessional_sessions for select using (public.can_access_course(course_id));
+create policy sessional_sessions_write on public.sessional_sessions for all using (
+  public.is_admin() or assigned_faculty=public.current_faculty_id() or exists(select 1 from public.course_faculty cf where cf.course_id=sessional_sessions.course_id and cf.faculty_id=public.current_faculty_id())
+) with check (
+  public.is_admin() or assigned_faculty=public.current_faculty_id() or exists(select 1 from public.course_faculty cf where cf.course_id=sessional_sessions.course_id and cf.faculty_id=public.current_faculty_id())
+);
+create policy assessment_components_read on public.assessment_components for select using (public.can_access_course(course_id));
+create policy assessment_components_write on public.assessment_components for all using (
+  public.is_admin() or exists(select 1 from public.course_faculty cf where cf.course_id=assessment_components.course_id and cf.faculty_id=public.current_faculty_id())
+) with check (
+  public.is_admin() or exists(select 1 from public.course_faculty cf where cf.course_id=assessment_components.course_id and cf.faculty_id=public.current_faculty_id())
+);
+create policy assessment_instances_read on public.assessment_instances for select using (public.can_access_course(course_id));
+create policy assessment_instances_write on public.assessment_instances for all using (
+  public.is_admin() or responsible_faculty=public.current_faculty_id() or exists(select 1 from public.course_faculty cf where cf.course_id=assessment_instances.course_id and cf.faculty_id=public.current_faculty_id())
+) with check (
+  public.is_admin() or responsible_faculty=public.current_faculty_id() or exists(select 1 from public.course_faculty cf where cf.course_id=assessment_instances.course_id and cf.faculty_id=public.current_faculty_id())
+);
+create policy sessional_grade_assignments_read on public.sessional_grade_assignments for select using (public.can_access_course(course_id));
+create policy sessional_grade_assignments_write on public.sessional_grade_assignments for all using (public.is_admin()) with check (public.is_admin());
+create policy sessional_grade_statuses_read on public.sessional_grade_statuses for select using (public.can_access_course(course_id));
+create policy sessional_grade_statuses_write on public.sessional_grade_statuses for all using (
+  public.is_admin() or responsible_faculty=public.current_faculty_id()
+) with check (
+  public.is_admin() or responsible_faculty=public.current_faculty_id()
+);
+create policy feedback_statuses_read on public.feedback_statuses for select using (public.can_access_course(course_id));
+create policy feedback_statuses_write on public.feedback_statuses for all using (
+  public.is_admin() or responsible_faculty=public.current_faculty_id() or exists(select 1 from public.course_faculty cf where cf.course_id=feedback_statuses.course_id and cf.faculty_id=public.current_faculty_id())
+) with check (
+  public.is_admin() or responsible_faculty=public.current_faculty_id() or exists(select 1 from public.course_faculty cf where cf.course_id=feedback_statuses.course_id and cf.faculty_id=public.current_faculty_id())
+);
+create policy course_file_statuses_read on public.course_file_statuses for select using (public.can_access_course(course_id));
+create policy course_file_statuses_write on public.course_file_statuses for all using (
+  public.is_admin() or responsible_faculty=public.current_faculty_id() or exists(select 1 from public.course_faculty cf where cf.course_id=course_file_statuses.course_id and cf.faculty_id=public.current_faculty_id())
+) with check (
+  public.is_admin() or responsible_faculty=public.current_faculty_id() or exists(select 1 from public.course_faculty cf where cf.course_id=course_file_statuses.course_id and cf.faculty_id=public.current_faculty_id())
+);
+create policy import_validation_issues_read on public.import_validation_issues for select using (public.is_admin());
+create policy import_validation_issues_write on public.import_validation_issues for all using (public.is_admin()) with check (public.is_admin());
 create policy audit_admin_read on public.audit_logs for select using (public.is_admin());
 
 -- Harden helper function execution to authenticated users only.

@@ -1,4 +1,4 @@
-# BME ExamFlow
+# BME Workflow
 
 A secure, faculty-centered academic examination workflow app designed from the department responsibility spreadsheet and styled after the visual language of the BME 4-1 Timetable Builder.
 
@@ -9,10 +9,11 @@ A secure, faculty-centered academic examination workflow app designed from the d
 - PostgreSQL Row Level Security (RLS): no anonymous read policies exist.
 - Personalized faculty feed, My Tasks, My Courses, course workflow detail.
 - Academic Week Progress Tracker with admin-controlled total weeks, latest completed week, pause/resume state, and week planner.
-- Explicit theory/lab course handling. Odd/even BME code inference is only a fallback; `course_type` is the authoritative value.
+- Explicit theory/sessional course handling. Odd/even BME code inference is only a fallback; `course_type` is the authoritative value and sessional courses can have a subtype such as laboratory, design, thesis, project, or other.
 - Class Test module with CT status, responsible faculty, schedule conflict checks, and reschedule history display.
-- Lab course module with configurable sessions, assessment components, assessment items, and lab-specific statuses.
-- Department calendar, setup center, notifications, and workload view covering theory, CT, and lab activities.
+- Sessional course module with configurable sessions, assessment components, assessment items, and sessional-specific statuses.
+- Course outline, term milestone, student feedback, Course File/CAR, and setup-warning models.
+- Department calendar, setup center, notifications, and workload view covering theory, CT, and sessional activities.
 - General department progress dashboard and course health.
 - Five primary assignments only: QP-A, QP-B, Moderator 01, Moderator 02, Script Scrutinizer.
 - Derived roles are automatic: Examiner A = QP-A; Examiner B = QP-B; Gradesheet Preparer = QP-A; Gradesheet Scrutinizer = Script Scrutinizer.
@@ -67,7 +68,7 @@ Create a new Supabase project, then run:
 2. `supabase/seed.local.sql` (generated from the private spreadsheet; git-ignored)
 3. Your private `supabase/allowlist.local.sql`
 
-If you already ran an older version of `schema.sql`, run the updated file again. The new v2 tables and policies are additive and the policy block is re-runnable.
+If you already ran an older version of `schema.sql`, run the updated file again. The new workbook-level tables and policies are additive and the policy block is re-runnable.
 
 The current package already contains `seed.local.sql` generated from the supplied CSV, but `.gitignore` prevents it from entering Git history.
 
@@ -119,7 +120,7 @@ The workflow `.github/workflows/pages.yml` injects only the public Supabase clie
 python scripts/generate_seed.py /path/to/export.csv
 ```
 
-This normalizes repeated whitespace in course codes (including the source `BME  207` → `BME 207`) and writes:
+This normalizes repeated whitespace in course codes, includes helpers for mixed workbook date formats and assessment-label cleanup, suggests theory/sessional course type from course-code parity, and writes:
 
 ```text
 supabase/seed.local.sql
