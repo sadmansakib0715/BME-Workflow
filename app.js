@@ -27,7 +27,7 @@
   const state = {
     supabase:null, demo:false, session:null, profile:null,
     faculty:[], courses:[], primaryAssignments:[], statuses:[], deadlines:[], auditLogs:[],
-    view:'home', courseId:null, search:'', statusFilter:'all', modal:null, authMode:'signin'
+    view:'home', courseId:null, search:'', statusFilter:'all', modal:null
   };
 
   const $app = document.getElementById('app');
@@ -143,32 +143,31 @@
   function renderUnauthorized(){ $app.innerHTML=`<div class="locked"><div class="locked-card"><p class="eyebrow">Access denied</p><h1>Unauthorized account</h1><p>Your login succeeded, but this account is not on the approved faculty allowlist. No academic data has been disclosed.</p></div></div>`; }
 
   function renderAuth(message='', type=''){
-    const isSignup = state.authMode === 'signup';
     $app.innerHTML=`<div class="auth-page"><div class="auth-wrap">
       <div class="auth-brand"><p class="eyebrow">Secure Academic Workflow</p><h1 class="brand">BME <span>ExamFlow</span></h1><p class="subtitle">Faculty-centered examination responsibility management.</p></div>
       <div class="auth-grid">
-        <div class="auth-card"><span class="kicker">Authorized Faculty Only</span><h2>${isSignup?'Create account':'Sign in'}</h2><p>${isSignup?'Use a BME BUET faculty email, then choose any password for this app.':'Use your BME BUET faculty email and the password you set during sign up.'}</p>
-          <div class="auth-switch" role="tablist" aria-label="Authentication mode"><button type="button" id="showSignin" class="${!isSignup?'active':''}" role="tab" aria-selected="${!isSignup}">Sign in</button><button type="button" id="showSignup" class="${isSignup?'active':''}" role="tab" aria-selected="${isSignup}">Sign up</button></div>
-          <form id="authForm"><div class="field"><label>Email</label><input type="email" name="email" required autocomplete="username" placeholder="name@bme.buet.ac.bd"><div class="field-help" id="emailHelp">Only addresses ending in @bme.buet.ac.bd can sign up.</div></div><div class="field"><label>Password</label><input type="password" name="password" required autocomplete="${isSignup?'new-password':'current-password'}"></div><div class="auth-actions"><button class="btn primary" type="submit" id="authSubmit">${isSignup?'Sign up':'Sign in'}</button>${!isSignup?'<button class="btn" type="button" id="magicBtn">Email magic link</button>':''}</div></form>
+        <div class="auth-card"><span class="kicker">Existing Account</span><h2>Sign in</h2><p>Use your BME BUET faculty email and the password you set during sign up.</p>
+          <form id="signinForm"><div class="field"><label>Email</label><input type="email" name="email" required autocomplete="username" placeholder="name@bme.buet.ac.bd"><div class="field-help">Only @bme.buet.ac.bd addresses are accepted.</div></div><div class="field"><label>Password</label><input type="password" name="password" required autocomplete="current-password"></div><div class="auth-actions"><button class="btn primary" type="submit">Sign in</button><button class="btn" type="button" id="magicBtn">Email magic link</button></div></form>
           ${message?`<div class="notice ${esc(type)}">${esc(message)}</div>`:''}
         </div>
-        <div class="auth-card"><span class="kicker">Security model</span><h2>Protected by identity + authorization</h2><p>Sign up is limited to faculty email addresses in the BME BUET domain. After a valid sign up, the same email and password can be used for future logins.</p><div class="notice">Protected academic records still require an active administrator-managed faculty profile before any data is disclosed.</div></div>
+        <div class="auth-card"><span class="kicker">New Faculty Account</span><h2>Sign up</h2><p>First create an account with a valid BME BUET faculty email. The password can be anything allowed by Supabase Auth settings.</p>
+          <form id="signupForm"><div class="field"><label>Email</label><input type="email" name="email" required autocomplete="username" placeholder="teacher@bme.buet.ac.bd"><div class="field-help">Only addresses ending in @bme.buet.ac.bd can sign up.</div></div><div class="field"><label>Set Password</label><input type="password" name="password" required autocomplete="new-password"></div><div class="auth-actions"><button class="btn accent" type="submit">Create account</button></div></form>
+          <div class="notice">After sign up, use the left side to sign in anytime with the same email and password.</div>
+        </div>
       </div>
     </div></div>`;
-    document.getElementById('authForm').addEventListener('submit',isSignup ? signUp : signIn);
-    document.getElementById('showSignin').addEventListener('click',()=>{state.authMode='signin';renderAuth();});
-    document.getElementById('showSignup').addEventListener('click',()=>{state.authMode='signup';renderAuth();});
-    document.querySelector('[name=email]').addEventListener('input',validateEmailField);
-    validateEmailField();
-    const magic=document.getElementById('magicBtn'); if(magic) magic.addEventListener('click',magicLink);
+    document.getElementById('signinForm').addEventListener('submit',signIn);
+    document.getElementById('signupForm').addEventListener('submit',signUp);
+    document.querySelectorAll('[name=email]').forEach(input=>{input.addEventListener('input',()=>validateEmailInput(input));validateEmailInput(input);});
+    document.getElementById('magicBtn').addEventListener('click',magicLink);
   }
   function facultyEmailError(email){
     if(!email) return 'Enter your BME BUET faculty email.';
     if(!FACULTY_EMAIL_RE.test(email)) return 'Use an address like name@bme.buet.ac.bd.';
     return '';
   }
-  function validateEmailField(){
-    const input=document.querySelector('[name=email]'), help=document.getElementById('emailHelp'), submit=document.getElementById('authSubmit');
+  function validateEmailInput(input){
+    const help=input?.closest('.field')?.querySelector('.field-help'), submit=input?.form?.querySelector('[type="submit"]');
     if(!input || !help || !submit) return true;
     const email=input.value.trim();
     const error=facultyEmailError(email);
@@ -176,8 +175,14 @@
     input.classList.toggle('invalid', !!error && !!email);
     help.textContent=error || 'This email can be used to sign up or sign in.';
     help.className=`field-help ${error && email ? 'error' : error ? '' : 'success'}`;
-    submit.disabled=state.authMode==='signup' && !!error;
+    submit.disabled=!!error;
     return !error;
+  }
+  function validateAuthForm(form){
+    const input=form.querySelector('[name=email]');
+    const valid=validateEmailInput(input);
+    if(!valid) form.reportValidity();
+    return valid;
   }
   function authCredentials(form){
     const fd=new FormData(form);
@@ -185,23 +190,22 @@
   }
   async function signIn(e){
     e.preventDefault();
-    if(!validateEmailField()){e.currentTarget.reportValidity();return}
+    if(!validateAuthForm(e.currentTarget)) return;
     const {email,password}=authCredentials(e.currentTarget);
     const {error}=await state.supabase.auth.signInWithPassword({email,password});
     if(error)renderAuth(error.message,'error');
   }
   async function signUp(e){
     e.preventDefault();
-    if(!validateEmailField()){e.currentTarget.reportValidity();return}
+    if(!validateAuthForm(e.currentTarget)) return;
     const {email,password}=authCredentials(e.currentTarget);
     const redirectTo=location.href.split('?')[0];
     const {data,error}=await state.supabase.auth.signUp({email,password,options:{emailRedirectTo:redirectTo}});
     if(error){renderAuth(error.message,'error');return}
     if(data.session){await bootstrap();return}
-    state.authMode='signin';
     renderAuth('Account created. Check your institutional inbox if Supabase asks for email confirmation, then sign in with the same password.','success');
   }
-  async function magicLink(){const email=document.querySelector('[name=email]').value.trim().toLowerCase();if(facultyEmailError(email)){toast('Enter a valid @bme.buet.ac.bd email first.','error');return}const redirectTo=location.href.split('?')[0];const {error}=await state.supabase.auth.signInWithOtp({email,options:{emailRedirectTo:redirectTo}});if(error)toast(error.message,'error');else renderAuth('Magic link sent. Check your institutional inbox.','success')}
+  async function magicLink(){const email=document.querySelector('#signinForm [name=email]').value.trim().toLowerCase();if(facultyEmailError(email)){toast('Enter a valid @bme.buet.ac.bd email first.','error');return}const redirectTo=location.href.split('?')[0];const {error}=await state.supabase.auth.signInWithOtp({email,options:{emailRedirectTo:redirectTo}});if(error)toast(error.message,'error');else renderAuth('Magic link sent. Check your institutional inbox.','success')}
 
   function shell(content){
     const f=state.profile?.faculty || byId(state.faculty,profileFacultyId()) || {};

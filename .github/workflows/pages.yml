@@ -30,6 +30,7 @@ jobs:
         run: |
           mkdir -p dist
           cp index.html app.css app.js demo-data.js dist/
+          sed -i "s/?v=local/?v=${GITHUB_SHA}/g" dist/index.html
           cat > dist/config.js <<CONFIG
           window.EXAMFLOW_CONFIG = {
             mode: "production",
