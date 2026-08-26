@@ -8,6 +8,11 @@ A secure, faculty-centered academic examination workflow app designed from the d
 - Supabase authentication + allowlist authorization.
 - PostgreSQL Row Level Security (RLS): no anonymous read policies exist.
 - Personalized faculty feed, My Tasks, My Courses, course workflow detail.
+- Academic Week Progress Tracker with admin-controlled total weeks, latest completed week, pause/resume state, and week planner.
+- Explicit theory/lab course handling. Odd/even BME code inference is only a fallback; `course_type` is the authoritative value.
+- Class Test module with CT status, responsible faculty, schedule conflict checks, and reschedule history display.
+- Lab course module with configurable sessions, assessment components, assessment items, and lab-specific statuses.
+- Department calendar, setup center, notifications, and workload view covering theory, CT, and lab activities.
 - General department progress dashboard and course health.
 - Five primary assignments only: QP-A, QP-B, Moderator 01, Moderator 02, Script Scrutinizer.
 - Derived roles are automatic: Examiner A = QP-A; Examiner B = QP-B; Gradesheet Preparer = QP-A; Gradesheet Scrutinizer = Script Scrutinizer.
@@ -27,6 +32,16 @@ The UI intentionally follows the supplied timetable-builder theme: warm paper ba
 GitHub Pages hosts only the static app shell. Protected data lives in Supabase. Authentication is necessary but **not sufficient**: a user must also have an active row in `allowed_users`, which is converted into an active `profiles` row on signup. RLS requires an active profile before data can be read.
 
 The Supabase anon key is a public client credential; it is **not** treated as an authorization secret. RLS is the security boundary. Never expose a Supabase service-role key in GitHub Pages, JavaScript, or repository variables.
+
+## Testing shortcut
+
+For smoother UI testing, the sign-in form accepts:
+
+```text
+sadmansakib715@gmail.com
+```
+
+with any non-empty password. This opens demo admin mode only. It does not authenticate against Supabase and it does not read or write protected academic records.
 
 ## 1. Preview safely
 
@@ -51,6 +66,8 @@ Create a new Supabase project, then run:
 1. `supabase/schema.sql`
 2. `supabase/seed.local.sql` (generated from the private spreadsheet; git-ignored)
 3. Your private `supabase/allowlist.local.sql`
+
+If you already ran an older version of `schema.sql`, run the updated file again. The new v2 tables and policies are additive and the policy block is re-runnable.
 
 The current package already contains `seed.local.sql` generated from the supplied CSV, but `.gitignore` prevents it from entering Git history.
 
