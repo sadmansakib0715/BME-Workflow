@@ -29,7 +29,7 @@ jobs:
           ACADEMIC_TERM: ${{ vars.ACADEMIC_TERM }}
         run: |
           mkdir -p dist
-          cp index.html app.css app.js demo-data.js dist/
+          cp index.html app.css app.js demo-data.js tracker-admin.js dist/
           sed -i "s/?v=local/?v=${GITHUB_SHA}/g" dist/index.html
           cat > dist/config.js <<CONFIG
           window.EXAMFLOW_CONFIG = {
