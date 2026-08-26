@@ -1,0 +1,26 @@
+--- a/app.js
++++ b/app.js
+@@
+-  const TEST_ADMIN_EMAIL = 'sadmansakib715@gmail.com';
+@@
+-          <div class="notice">Testing shortcut: ${TEST_ADMIN_EMAIL} can sign in with any non-empty password and opens demo admin mode.</div>
+@@
+   function authEmailError(input,email){
+-    if(input?.form?.id === 'signinForm' && email.toLowerCase() === TEST_ADMIN_EMAIL) return '';
+     return facultyEmailError(email);
+   }
+-  function isTestAdminShortcut(email,password){ return email.toLowerCase() === TEST_ADMIN_EMAIL && password.length > 0; }
+@@
+-    help.textContent=email.toLowerCase() === TEST_ADMIN_EMAIL ? 'Testing shortcut: opens demo admin mode with any password.' : error || 'This email can be used to sign up or sign in.';
++    help.textContent=error || 'This email can be used to sign up or sign in.';
+@@
+   async function signIn(e){
+     e.preventDefault();
+     const {email,password}=authCredentials(e.currentTarget);
+-    if(isTestAdminShortcut(email,password)){
+-      loadDemo();
+-      render();
+-      toast('Test admin demo mode enabled. No protected Supabase data was loaded.','success');
+-      return;
+-    }
+     if(!validateAuthForm(e.currentTarget)) return;
