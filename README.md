@@ -76,7 +76,9 @@ Do **not** guess institutional email addresses. They are deliberately not inferr
 
 Recommended:
 
-- Disable open/public registration if your Auth configuration permits it, or keep signup available but rely on the allowlist + RLS for access.
+- Keep email/password signup enabled. The app and schema restrict signup to addresses matching `name@bme.buet.ac.bd`.
+- Do not add app-side password rules. If you need very short passwords to work, keep Supabase Auth password-strength settings relaxed enough for that policy.
+- Keep the allowlist + RLS protection for academic records. A signed-up account can authenticate, but protected data is visible only after that email maps to an active faculty profile.
 - Configure institutional Google/OIDC provider if available.
 - Keep email/password or magic-link as a fallback.
 - Enable MFA for admin/HOD accounts if possible.

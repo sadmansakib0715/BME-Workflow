@@ -20,6 +20,18 @@ create table if not exists public.allowed_users (
   created_at timestamptz not null default now()
 );
 create unique index if not exists allowed_users_email_lower_unique on public.allowed_users(lower(email));
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint
+    where conname='allowed_users_bme_email_check'
+      and conrelid='public.allowed_users'::regclass
+  ) then
+    alter table public.allowed_users
+      add constraint allowed_users_bme_email_check
+      check (email ~* '^[^@[:space:]]+@bme\.buet\.ac\.bd$');
+  end if;
+end $$;
 
 create table if not exists public.profiles (
   user_id uuid primary key references auth.users(id) on delete cascade,
@@ -127,6 +139,18 @@ returns uuid language sql stable security definer set search_path=public as $$
     else null end
   from public.primary_assignments a where a.course_id=p_course;
 $$;
+
+create or replace function public.enforce_bme_auth_email()
+returns trigger language plpgsql security definer set search_path=public as $$
+begin
+  if new.email is null or new.email !~* '^[^@[:space:]]+@bme\.buet\.ac\.bd$' then
+    raise exception 'Only @bme.buet.ac.bd faculty email addresses can sign up.';
+  end if;
+  return new;
+end;$$;
+drop trigger if exists enforce_bme_auth_email_trg on auth.users;
+create trigger enforce_bme_auth_email_trg before insert or update of email on auth.users
+for each row execute function public.enforce_bme_auth_email();
 
 create or replace function public.handle_new_user()
 returns trigger language plpgsql security definer set search_path=public as $$
@@ -307,6 +331,7 @@ revoke all on function public.current_faculty_id() from public;
 revoke all on function public.is_admin() from public;
 revoke all on function public.assignee_for_task(uuid,text) from public;
 revoke all on function public.can_access_course(uuid) from public;
+revoke all on function public.enforce_bme_auth_email() from public;
 revoke all on function public.claim_allowed_profile() from public;
 grant execute on function public.has_active_profile() to authenticated;
 grant execute on function public.current_faculty_id() to authenticated;
