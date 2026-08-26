@@ -24,6 +24,7 @@
   const STAGE_ORDER = ['Question Preparation','Question Moderation','Script Examination','Script Scrutiny','Gradesheet Preparation','Gradesheet Scrutiny'];
   const STATUS_LABEL = {not_started:'Not Started',waiting:'Waiting',in_progress:'In Progress',submitted:'Submitted',completed:'Completed',overdue:'Overdue',blocked:'Blocked'};
   const FACULTY_EMAIL_RE = /^[^@\s]+@bme\.buet\.ac\.bd$/i;
+  const TEST_ADMIN_EMAIL = 'sadmansakib715@gmail.com';
   const state = {
     supabase:null, demo:false, session:null, profile:null,
     faculty:[], courses:[], primaryAssignments:[], statuses:[], deadlines:[], auditLogs:[],
@@ -166,14 +167,21 @@
     if(!FACULTY_EMAIL_RE.test(email)) return 'Use an address like name@bme.buet.ac.bd.';
     return '';
   }
+  function authEmailError(input,email){
+    if(input?.form?.id === 'signinForm' && email.toLowerCase() === TEST_ADMIN_EMAIL) return '';
+    return facultyEmailError(email);
+  }
+  function isTestAdminShortcut(email,password){
+    return email.toLowerCase() === TEST_ADMIN_EMAIL && password.length > 0;
+  }
   function validateEmailInput(input){
     const help=input?.closest('.field')?.querySelector('.field-help'), submit=input?.form?.querySelector('[type="submit"]');
     if(!input || !help || !submit) return true;
     const email=input.value.trim();
-    const error=facultyEmailError(email);
+    const error=authEmailError(input,email);
     input.setCustomValidity(error);
     input.classList.toggle('invalid', !!error && !!email);
-    help.textContent=error || 'This email can be used to sign up or sign in.';
+    help.textContent=email.toLowerCase() === TEST_ADMIN_EMAIL ? 'Testing shortcut: opens demo admin mode.' : error || 'This email can be used to sign up or sign in.';
     help.className=`field-help ${error && email ? 'error' : error ? '' : 'success'}`;
     submit.disabled=!!error;
     return !error;
@@ -190,8 +198,14 @@
   }
   async function signIn(e){
     e.preventDefault();
-    if(!validateAuthForm(e.currentTarget)) return;
     const {email,password}=authCredentials(e.currentTarget);
+    if(isTestAdminShortcut(email,password)){
+      loadDemo();
+      render();
+      toast('Test admin demo mode enabled. No protected Supabase data was loaded.','success');
+      return;
+    }
+    if(!validateAuthForm(e.currentTarget)) return;
     const {error}=await state.supabase.auth.signInWithPassword({email,password});
     if(error)renderAuth(error.message,'error');
   }
