@@ -14,7 +14,7 @@
   const today=()=>new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Dhaka',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
   const days=(date,now=today())=>date?Math.round((Date.parse(date+'T12:00:00Z')-Date.parse(now+'T12:00:00Z'))/86400000):null;
   const isAdmin=p=>!!p?.active&&['admin','hod'].includes(p.app_role);
-  const manages=(data,course,p)=>isAdmin(p)||(data.courseFaculty||[]).some(r=>r.course_id===course&&r.faculty_id===p?.faculty_id&&['coordinator','sessional_coordinator'].includes(r.role));
+  const manages=(data,course,p)=>isAdmin(p)||(data.courseFaculty||[]).some(r=>r.course_id===course&&r.faculty_id===p?.faculty_id);
   function activities(d){
     const out=[],courses=new Map((d.courses||[]).map(c=>[c.id,c]));
     const milestone=(type,cid)=>(d.termMilestones||[]).find(m=>m.course_id===cid&&m.milestone_type===type)?.milestone_date||(d.termMilestones||[]).find(m=>!m.course_id&&m.milestone_type===type)?.milestone_date||null;
