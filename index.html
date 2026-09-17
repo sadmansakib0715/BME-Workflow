@@ -1,22 +1,24 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta name="description" content="Secure faculty-centered academic activity management for BME." />
-  <meta name="color-scheme" content="light" />
-  <title>BME Workflow</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="./app.css?v=local" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="description" content="A considered space for your academic day. BME Workflow connects faculty, courses, and the next step.">
+  <meta name="theme-color" content="#f5f5f7">
+  <meta name="color-scheme" content="light">
+  <title>BME Workflow — Your day, in focus</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='11' fill='%231d1d1f'/%3E%3Cpath d='M12 17v7m8-14v20m8-15v12' stroke='white' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="./app.css?v=local">
+  <script defer src="./config.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.112.3"></script>
+  <script defer src="./workflow-core.js?v=local"></script>
+  <script defer src="./workflow-store.js?v=local"></script>
+  <script defer src="./app.js?v=local"></script>
 </head>
 <body>
-  <div id="app" aria-live="polite"></div>
-  <script src="./config.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.112.3"></script>
-  <script src="./demo-data.js?v=local"></script>
-  <script src="./app.js?v=local"></script>
-  <script src="./tracker-admin.js?v=local"></script>
+  <div id="app"><main class="landing"><p class="eyebrow">BME WORKFLOW</p><h1>A little clarity.<br>A lot of progress.</h1><p class="landing-description" role="status">Opening your workspace…</p></main></div>
+  <dialog id="dialog" aria-labelledby="dialog-title"><div class="dialog-heading"><h2 id="dialog-title"></h2><button id="dialog-close" aria-label="Close dialog">×</button></div><div class="dialog-body" id="dialog-body"></div></dialog>
+  <div id="toasts" class="toast-wrap"></div>
+  <noscript><p>Enable JavaScript to sign in to your faculty workspace.</p></noscript>
 </body>
 </html>

@@ -1,903 +1,132 @@
 (() => {
   'use strict';
-
-  const TASKS = [
-    {key:'question_prep_a', label:'Question Preparation - Section A', short:'QP-A', stage:'Question Preparation', order:1, source:'preparer_a'},
-    {key:'question_prep_b', label:'Question Preparation - Section B', short:'QP-B', stage:'Question Preparation', order:2, source:'preparer_b'},
-    {key:'moderation_1', label:'Question Moderator 01', short:'MOD-1', stage:'Question Moderation', order:3, source:'moderator_1'},
-    {key:'moderation_2', label:'Question Moderator 02', short:'MOD-2', stage:'Question Moderation', order:4, source:'moderator_2'},
-    {key:'examination_a', label:'Script Examination - Section A', short:'EX-A', stage:'Script Examination', order:5, source:'preparer_a', derived:true},
-    {key:'examination_b', label:'Script Examination - Section B', short:'EX-B', stage:'Script Examination', order:6, source:'preparer_b', derived:true},
-    {key:'scrutiny', label:'Script Scrutiny', short:'SCR', stage:'Script Scrutiny', order:7, source:'scrutinizer'},
-    {key:'gradesheet_prep', label:'Gradesheet Preparation', short:'GS-P', stage:'Gradesheet Preparation', order:8, source:'preparer_a', derived:true},
-    {key:'gradesheet_scrutiny', label:'Gradesheet Scrutiny', short:'GS-S', stage:'Gradesheet Scrutiny', order:9, source:'scrutinizer', derived:true}
-  ];
-  const DEPENDENCIES = {
-    moderation_1:['question_prep_a','question_prep_b'],
-    moderation_2:['question_prep_a','question_prep_b'],
-    examination_a:['moderation_1','moderation_2'],
-    examination_b:['moderation_1','moderation_2'],
-    scrutiny:['examination_a','examination_b'],
-    gradesheet_prep:['scrutiny'],
-    gradesheet_scrutiny:['gradesheet_prep']
-  };
-  const STAGE_ORDER = ['Question Preparation','Question Moderation','Script Examination','Script Scrutiny','Gradesheet Preparation','Gradesheet Scrutiny'];
-  const STATUS_LABEL = {not_started:'Not Started',waiting:'Waiting',in_progress:'In Progress',submitted:'Submitted',completed:'Completed',overdue:'Overdue',blocked:'Blocked'};
-  const CT_STATUS_LABEL = {not_planned:'Not Started / Not Planned',scheduled:'CT Scheduled',ct_taken:'CT Taken',scripts_under_examination:'Scripts Under Examination',scripts_checked:'Scripts Checked',marks_published:'Marks Published',proposed:'Proposed',confirmed:'CT Scheduled',completed:'Marks Published',postponed:'Postponed',rescheduled:'Rescheduled',cancelled:'Cancelled'};
-  const SESSIONAL_STATUS_LABEL = {not_started:'Not Started',scheduled:'Scheduled',in_progress:'In Progress',conducted:'Conducted',submission_pending:'Submission Pending',evaluation_pending:'Evaluation Pending',completed:'Completed',cancelled:'Cancelled',setup_required:'Setup Required',configured:'Configured',evaluation_taken:'Evaluation Taken',marking_complete:'Marking Complete',marks_uploaded:'Marks Uploaded in Excel'};
-  const OUTLINE_STATUS_LABEL = {not_started:'Not Started',under_preparation:'Under Preparation',prepared:'Prepared',shared_with_students:'Shared with Students'};
-  const FACULTY_EMAIL_RE = /^[^@\s]+@bme\.buet\.ac\.bd$/i;
-  const TEST_ADMIN_EMAIL = 'sadmansakib715@gmail.com';
-
-  const state = {
-    supabase:null, demo:false, session:null, profile:null,
-    faculty:[], courses:[], primaryAssignments:[], statuses:[], deadlines:[], auditLogs:[],
-    term:null, academicWeeks:[], termMilestones:[], courseSections:[], courseFaculty:[], classTests:[], classTestHistory:[],
-    courseOutlines:[], feedbackStatuses:[], courseFileStatuses:[],
-    sessionalConfigs:[], sessionalSessions:[], assessmentComponents:[], assessmentInstances:[],
-    sessionalGradeAssignments:[], sessionalGradeStatuses:[],
-    labConfigs:[], labSessions:[], labAssessmentTypes:[], labAssessmentItems:[], labActivityAssignments:[],
-    events:[], notifications:[], view:'home', courseId:null, search:'', statusFilter:'all', calendarFilter:'all',
-    selectedWeek:null, modal:null
-  };
-
-  const $app = document.getElementById('app');
-  const cfg = window.EXAMFLOW_CONFIG || {};
-  const esc = (v='') => String(v ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#039;','"':'&quot;'}[c]));
-  const clone = value => typeof structuredClone === 'function' ? structuredClone(value) : JSON.parse(JSON.stringify(value));
-  const byId = (list,id) => list.find(x=>x.id===id);
-  const fmtDate = (d) => d ? new Intl.DateTimeFormat('en-GB',{day:'2-digit',month:'short',year:'numeric'}).format(new Date(`${d}T00:00:00`)) : 'Not set';
-  const todayIso = () => new Date().toLocaleDateString('en-CA',{timeZone:'Asia/Dhaka'});
-  const isAdmin = () => ['admin','hod'].includes(state.profile?.app_role);
-  const activeProfile = () => !!state.profile?.active;
-  const profileFacultyId = () => state.profile?.faculty_id || state.profile?.faculty?.id || null;
-  const facultyName = id => byId(state.faculty,id)?.full_name || 'Unassigned';
-  const courseById = id => byId(state.courses,id) || {};
-  const activeTerm = () => state.term || defaultTerm();
-  const assignmentFor = courseId => state.primaryAssignments.find(a=>a.course_id===courseId) || {};
-  const sessionalConfigFor = courseId => state.sessionalConfigs.find(c=>c.course_id===courseId) || state.labConfigs.find(c=>c.course_id===courseId) || {};
-  const sessionalSessionsFor = courseId => (state.sessionalSessions.length ? state.sessionalSessions : state.labSessions).filter(s=>s.course_id===courseId);
-  const assessmentComponentsFor = courseId => (state.assessmentComponents.length ? state.assessmentComponents : state.labAssessmentTypes).filter(t=>t.course_id===courseId);
-  const assessmentInstancesFor = courseId => (state.assessmentInstances.length ? state.assessmentInstances : state.labAssessmentItems).filter(i=>i.course_id===courseId);
-  const labConfigFor = sessionalConfigFor;
-  const labSessionsFor = sessionalSessionsFor;
-  const labItemsFor = assessmentInstancesFor;
-  const classTestsFor = courseId => state.classTests.filter(c=>c.course_id===courseId);
-  const ctDate = ct => ct.scheduled_date || ct.date || null;
-  const ctTime = ct => ct.scheduled_time || ct.time || '';
-
-  function defaultTerm(){
-    return {id:'term-local', name:cfg.academicTerm || 'January 2026', total_teaching_weeks:14, latest_completed_week:9, calendar_status:'active', pause_reason:'', active:true};
+  const W=window.Workflow, cfg=window.EXAMFLOW_CONFIG||{}, $=s=>document.querySelector(s);
+  const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const icons={home:'<path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z"/>',tasks:'<path d="m4 6 2 2 3-4M12 6h8M4 13l2 2 3-4M12 13h8M4 20h16"/>',courses:'<path d="M3 4h6a4 4 0 0 1 3 2 4 4 0 0 1 3-2h6v16h-6a4 4 0 0 0-3 1 4 4 0 0 0-3-1H3zM12 6v15"/>',calendar:'<rect x="3" y="5" width="18" height="16" rx="3"/><path d="M7 3v4M17 3v4M3 11h18M8 15h2M14 15h2"/>',bell:'<path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/>',settings:'<path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3"/><circle cx="15" cy="17" r="3"/>',arrow:'<path d="M5 12h14m-5-5 5 5-5 5"/>',check:'<path d="m5 12 4 4L19 6"/>',plus:'<path d="M12 5v14M5 12h14"/>',close:'<path d="m6 6 12 12M6 18 18 6"/>',search:'<circle cx="10" cy="10" r="6"/><path d="m15 15 5 5"/>',logout:'<path d="M9 4H4v16h5M9 12h12m-5-5 5 5-5 5"/>',clock:'<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',upload:'<path d="M12 16V3m-5 5 5-5 5 5M4 15v6h16v-6"/>',shield:'<path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6zM8 12l3 3 5-6"/>'};
+  const icon=(name,cls='')=>`<svg class="icon ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icons[name]||icons.tasks}</svg>`;
+  const fmt=d=>d?new Intl.DateTimeFormat('en-GB',{day:'numeric',month:'short',timeZone:'Asia/Dhaka'}).format(new Date(d+'T12:00:00Z')):'No deadline';
+  const data=()=>store.data, admin=()=>W.isAdmin(store.profile), fid=()=>store.profile?.faculty_id;
+  const name=id=>data().faculty?.find(f=>f.id===id)?.full_name||'Unassigned';
+  const all=()=>W.activities(data()), mine=()=>all().filter(a=>a.owner===fid());
+  const options=(items,value)=>items.map(x=>{const [v,l]=Array.isArray(x)?x:[x,W.text(x)];return `<option value="${esc(v)}" ${v===value?'selected':''}>${esc(l)}</option>`;}).join('');
+  const badge=(status,kind)=>`<span class="badge ${W.done(kind,status)?'complete':status==='blocked'?'blocked':''}">${esc(W.text(status))}</span>`;
+  let store=new window.WorkflowStore.Store(null), view='home', bucket='attention', search='', courseId=null, calendarOffset=0, importRows=null, importFingerprint=null, refreshToken=0, busy=false;
+  let priorFocus=null;
+  const notice=(msg,type='')=>{const n=document.createElement('div');n.className='toast '+type;n.setAttribute('role',type==='error'?'alert':'status');n.textContent=msg;$('#toasts').append(n);setTimeout(()=>n.remove(),6000);};
+  const button=(label,action,cls='secondary',attrs='')=>`<button class="button ${cls}" data-action="${action}" ${attrs}>${label}</button>`;
+  function empty(title,body=''){return `<div class="empty-state"><span class="empty-icon">${icon('check')}</span><h3>${esc(title)}</h3><p>${esc(body)}</p></div>`;}
+  function header(kicker,title,body='',action=''){return `<div class="page-heading"><div><p class="eyebrow">${esc(kicker)}</p><h1>${esc(title)}</h1>${body?`<p class="subtitle">${esc(body)}</p>`:''}</div>${action}</div>`;}
+  function taskRow(a){
+    const b=W.bucket(a),late=!a.finished&&!a.cancelled&&a.date&&W.days(a.date)<0;
+    return `<button class="task-row" data-activity="${esc(a.id)}"><span class="task-icon ${a.kind}">${icon(a.finished?'check':a.kind==='ct'?'calendar':a.kind==='outline'?'courses':'tasks')}</span><span class="task-copy"><span class="task-course">${esc(a.course.course_code)}<span class="separator">/</span>${esc(a.row.section||a.row.scope||W.LABELS[a.kind])}</span><strong>${esc(a.title)}</strong><span class="task-detail">${a.waiting.length?'Waiting for '+esc(a.waiting.map(x=>x?.title||'prerequisite').join(', ')):esc(name(a.owner))}</span></span><span class="task-end"><span class="${late?'late':''}">${a.finished?'Completed':a.cancelled?'Cancelled':late?'Update needed · '+fmt(a.date):fmt(a.date)}</span>${badge(a.status,a.kind)}</span>${icon('arrow','row-arrow')}</button>`;
   }
-  function suggestCourseType(code=''){
-    const match = String(code).match(/(\d{3})\b/);
-    if(!match) return 'theory';
-    return Number(match[1]) % 2 === 0 ? 'sessional' : 'theory';
-  }
-  function courseType(course){
-    const raw = String(course.course_type || suggestCourseType(course.course_code)).toLowerCase();
-    if(raw === 'lab') return 'sessional';
-    return raw === 'theory' ? 'theory' : 'sessional';
-  }
-  function isTheoryCourse(course){ return courseType(course) === 'theory'; }
-  function isSessionalCourse(course){ return courseType(course) === 'sessional'; }
-  function isLabCourse(course){ return isSessionalCourse(course); }
-  function statusRow(courseId,key){ return state.statuses.find(s=>s.course_id===courseId && s.task_key===key); }
-  function dueDateFor(course,key){
-    const override = state.deadlines.find(d=>d.course_id===course.id && d.task_key===key)?.due_date;
-    if(override) return override;
-    if(['question_prep_a','question_prep_b','moderation_1','moderation_2'].includes(key)) return course.question_deadline || null;
-    return course.final_gradesheet_deadline || null;
-  }
-  function taskCanStart(courseId,key){ return (DEPENDENCIES[key] || []).every(dep => (statusRow(courseId,dep)?.status || 'not_started') === 'completed'); }
-  function statusFor(course,key){
-    const raw = statusRow(course.id,key)?.status || 'not_started';
-    const due = dueDateFor(course,key);
-    if(raw !== 'completed' && due && due < todayIso()) return 'overdue';
-    if(raw === 'not_started' && (DEPENDENCIES[key] || []).length && !taskCanStart(course.id,key)) return 'waiting';
-    return raw;
-  }
-  function assigneeFor(courseId,key){
-    const task = TASKS.find(t=>t.key===key);
-    const a = assignmentFor(courseId);
-    return task ? a[task.source] || null : null;
-  }
-  function theoryCourses(){ return state.courses.filter(isTheoryCourse); }
-  function sessionalCourses(){ return state.courses.filter(isSessionalCourse); }
-  function labCourses(){ return sessionalCourses(); }
-  function taskObjects(){
-    return theoryCourses().flatMap(course => TASKS.map(task => ({
-      ...task, kind:'theory', course, assignee_id:assigneeFor(course.id,task.key), status:statusFor(course,task.key), due_date:dueDateFor(course,task.key)
-    })));
-  }
-  function courseTeachers(courseId){
-    const rows = state.courseFaculty.filter(r=>r.course_id===courseId);
-    return rows.map(r => ({...r, name:facultyName(r.faculty_id)}));
-  }
-  function courseIsMine(course){
-    const fid = profileFacultyId();
-    if(isTheoryCourse(course) && TASKS.some(t=>assigneeFor(course.id,t.key)===fid)) return true;
-    if(state.courseFaculty.some(r=>r.course_id===course.id && r.faculty_id===fid)) return true;
-    if(state.classTests.some(ct=>ct.course_id===course.id && ct.responsible_faculty===fid)) return true;
-    if(state.labSessions.some(s=>s.course_id===course.id && s.assigned_faculty===fid)) return true;
-    if(state.labAssessmentItems.some(i=>i.course_id===course.id && i.responsible_faculty===fid)) return true;
-    return false;
-  }
-  function myTheoryTasks(){ return taskObjects().filter(t=>t.assignee_id===profileFacultyId()); }
-  function myClassTests(){ return state.classTests.filter(ct=>ct.responsible_faculty===profileFacultyId() || courseIsMine(courseById(ct.course_id))); }
-  function mySessionalSessions(){ return (state.sessionalSessions.length ? state.sessionalSessions : state.labSessions).filter(s=>s.assigned_faculty===profileFacultyId() || courseIsMine(courseById(s.course_id))); }
-  function myAssessmentInstances(){ return (state.assessmentInstances.length ? state.assessmentInstances : state.labAssessmentItems).filter(i=>i.responsible_faculty===profileFacultyId() || courseIsMine(courseById(i.course_id))); }
-  function myLabSessions(){ return mySessionalSessions(); }
-  function myLabItems(){ return myAssessmentInstances(); }
-  function progressPct(items){ if(!items.length) return 0; return Math.round(items.filter(t=>['completed','conducted','configured'].includes(t.status)).length/items.length*100); }
-  function statusBadge(status, labels=STATUS_LABEL){
-    return `<span class="badge ${esc(status)}">${esc(labels[status] || status || 'Unknown')}</span>`;
-  }
-  function typeBadge(course){
-    const type = courseType(course);
-    return `<span class="badge ${type}">${type === 'sessional' ? 'Sessional' : 'Theory'}</span>`;
-  }
-  function milestoneLabel(type=''){
-    const labels = {
-      COURSE_OUTLINE_SHARING:'Course Outline Sharing Deadline',
-      QUESTION_SUBMISSION_DEADLINE:'Question Submission Deadline',
-      FEEDBACK_START:'Feedback Start',
-      FEEDBACK_DEADLINE:'Feedback Deadline',
-      THEORY_GRADESHEET_DEADLINE:'Theory Gradesheet Deadline',
-      SESSIONAL_GRADESHEET_DEADLINE:'Sessional Gradesheet Deadline',
-      CAR_DEADLINE:'Course File / CAR Deadline'
-    };
-    return labels[type] || String(type || 'Term Milestone').replace(/_/g,' ').toLowerCase().replace(/\b\w/g,c=>c.toUpperCase());
-  }
-  function milestoneDate(type){
-    return state.termMilestones.find(m=>m.milestone_type===type)?.milestone_date || null;
-  }
-  function weekForDate(date){
-    if(!date) return null;
-    const row = state.academicWeeks.find(w=>w.starts_on && w.ends_on && w.starts_on <= date && date <= w.ends_on);
-    if(row) return row.week_no;
-    const term = activeTerm();
-    if(!term.start_date) return null;
-    const diff = daysBetween(term.start_date,date);
-    return diff >= 0 ? Math.floor(diff / 7) + 1 : null;
-  }
-  function eventsForAll(){
-    const events = [];
-    for(const m of state.termMilestones){
-      events.push({id:`milestone-${m.id}`, type:'Deadline', date:m.milestone_date, time:'', week:weekForDate(m.milestone_date), courseId:m.course_id, course:courseById(m.course_id), title:milestoneLabel(m.milestone_type), status:m.status || 'scheduled', facultyId:m.faculty_id, detail:m.notes || 'Term-level milestone'});
-    }
-    for(const row of state.events){
-      const c = courseById(row.course_id);
-      events.push({id:`event-${row.id}`, type:row.event_type || 'Academic Event', date:row.event_date, time:row.event_time || '', week:weekForDate(row.event_date), courseId:row.course_id, course:c, title:row.title, status:row.status || 'scheduled', facultyId:row.faculty_id, detail:row.source_table ? `Source: ${row.source_table}` : facultyName(row.faculty_id)});
-    }
-    for(const o of state.courseOutlines){
-      const c = courseById(o.course_id);
-      const due = o.due_date || milestoneDate('COURSE_OUTLINE_SHARING');
-      if(due) events.push({id:`outline-${o.course_id}`, type:'Course Outline', date:due, time:'', week:weekForDate(due), courseId:o.course_id, course:c, title:'Course outline sharing', status:o.status || 'not_started', facultyId:o.responsible_faculty, detail:OUTLINE_STATUS_LABEL[o.status] || 'Not Started'});
-    }
-    for(const t of taskObjects()){
-      if(t.due_date) events.push({id:`task-${t.course.id}-${t.key}`, type:'Theory Deadline', date:t.due_date, time:'', week:weekForDate(t.due_date), courseId:t.course.id, course:t.course, title:t.label, status:t.status, facultyId:t.assignee_id, detail:`Responsible: ${facultyName(t.assignee_id)}`});
-    }
-    for(const ct of state.classTests){
-      const c = courseById(ct.course_id);
-      events.push({id:`ct-${ct.id}`, type:'Class Test', date:ctDate(ct), time:ctTime(ct), week:weekForDate(ctDate(ct)), courseId:ct.course_id, course:c, title:`${ct.title || `CT ${ct.ct_number || ''}`} - Section ${ct.section || 'All'}`, status:ct.status || 'not_planned', facultyId:ct.responsible_faculty || ct.responsible_faculty_id, detail:`${ct.batch || c.batch || ''}${ct.syllabus ? ` | ${ct.syllabus}` : ''}`});
-    }
-    const legacySessions = state.sessionalSessions.length ? [] : state.labSessions;
-    for(const s of legacySessions){
-      const c = courseById(s.course_id);
-      events.push({id:`lab-${s.id}`, type:'Sessional Session', date:s.date, time:'', week:weekForDate(s.date), courseId:s.course_id, course:c, title:`Session ${String(s.session_no || '').padStart(2,'0')} - ${s.title}`, status:s.status, facultyId:s.assigned_faculty, detail:`${s.section || 'All'} ${s.group_label || ''}`});
-    }
-    for(const s of state.sessionalSessions){
-      const c = courseById(s.course_id);
-      events.push({id:`sessional-${s.id}`, type:'Sessional Session', date:s.date, time:s.scheduled_time || '', week:weekForDate(s.date), courseId:s.course_id, course:c, title:`Session ${String(s.session_no || s.sequence_number || '').padStart(2,'0')} - ${s.title}`, status:s.status, facultyId:s.assigned_faculty, detail:`${s.section || s.scope || 'Entire Course'} ${s.group_label || ''}`});
-    }
-    const legacyItems = state.assessmentInstances.length ? [] : state.labAssessmentItems;
-    for(const i of legacyItems.concat(state.assessmentInstances)){
-      const c = courseById(i.course_id);
-      events.push({id:`assessment-${i.id}`, type:'Sessional Assessment', date:i.due_date || i.scheduled_date, time:'', week:weekForDate(i.due_date || i.scheduled_date), courseId:i.course_id, course:c, title:i.title, status:i.status, facultyId:i.responsible_faculty, detail:`${i.marks || i.marks_each || 0} marks | ${facultyName(i.responsible_faculty)}`});
-    }
-    for(const f of state.feedbackStatuses){
-      const c = courseById(f.course_id), due=f.deadline || milestoneDate('FEEDBACK_DEADLINE');
-      if(due) events.push({id:`feedback-${f.course_id}`, type:'Feedback', date:due, time:'', week:weekForDate(due), courseId:f.course_id, course:c, title:'Student feedback', status:f.status || 'not_started', facultyId:f.responsible_faculty, detail:f.notes || 'Feedback workflow'});
-    }
-    for(const cf of state.courseFileStatuses){
-      const c = courseById(cf.course_id), due=cf.deadline || milestoneDate('CAR_DEADLINE');
-      if(due) events.push({id:`course-file-${cf.course_id}`, type:'Course File', date:due, time:'', week:weekForDate(due), courseId:cf.course_id, course:c, title:'Course File / CAR', status:cf.status || 'not_started', facultyId:cf.responsible_faculty, detail:cf.notes || 'Course file workflow'});
-    }
-    return events.filter(e=>e.date).sort((a,b)=>(a.date || '').localeCompare(b.date || '') || (a.time || '').localeCompare(b.time || ''));
-  }
-  function myAcademicEvents(){
-    const fid = profileFacultyId();
-    return eventsForAll().filter(e=>e.facultyId===fid || courseIsMine(e.course));
-  }
-
-  function toast(message,type=''){
-    let wrap=document.querySelector('.toast-wrap');
-    if(!wrap){wrap=document.createElement('div');wrap.className='toast-wrap';document.body.appendChild(wrap);}
-    const el=document.createElement('div');el.className=`toast ${type}`;el.textContent=message;wrap.appendChild(el);
-    setTimeout(()=>el.remove(),3400);
-  }
-
-  async function init(){
-    const params = new URLSearchParams(location.search);
-    if(params.get('demo') === '1'){
-      loadDemo(); render(); return;
-    }
-    if(cfg.mode !== 'production' || !cfg.supabaseUrl || !cfg.supabaseAnonKey){
-      renderLocked(); return;
-    }
-    if(!window.supabase){ renderFatal('Authentication library could not be loaded.'); return; }
-    state.supabase = window.supabase.createClient(cfg.supabaseUrl,cfg.supabaseAnonKey,{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true}});
-    const {data:{session}} = await state.supabase.auth.getSession();
-    state.session=session;
-    state.supabase.auth.onAuthStateChange(async (_event,session)=>{ state.session=session; if(session) await bootstrap(); else {state.profile=null;renderAuth();} });
-    if(session) await bootstrap(); else renderAuth();
-  }
-
-  function loadDemo(){
-    state.demo=true;
-    const d=window.EXAMFLOW_DEMO || {};
-    for(const key of ['faculty','courses','primaryAssignments','statuses','academicWeeks','termMilestones','courseSections','courseFaculty','classTests','classTestHistory','courseOutlines','feedbackStatuses','courseFileStatuses','sessionalConfigs','sessionalSessions','assessmentComponents','assessmentInstances','sessionalGradeAssignments','sessionalGradeStatuses','labConfigs','labSessions','labAssessmentTypes','labAssessmentItems','events','notifications']){
-      state[key]=clone(d[key] || []);
-    }
-    state.term=clone(d.term || defaultTerm());
-    state.deadlines=[];
-    state.auditLogs=[
-      {id:3,table_name:'academic_terms',action:'UPDATE',row_key:'term-jan-2026',created_at:'2026-08-26T09:30:00+06:00'},
-      {id:2,table_name:'class_tests',action:'UPDATE',row_key:'ct2',created_at:'2026-08-25T16:10:00+06:00'},
-      {id:1,table_name:'primary_assignments',action:'UPDATE',row_key:'c2',created_at:'2026-08-24T16:10:00+06:00'}
-    ];
-    state.profile={user_id:'demo-user',faculty_id:'f3',app_role:'admin',active:true,faculty:byId(state.faculty,'f3')};
-    state.selectedWeek=state.term.latest_completed_week;
-  }
-
-  async function selectOptional(table, build, fallback=[]){
-    try{
-      const query = build ? build(state.supabase.from(table)) : state.supabase.from(table).select('*');
-      const {data,error} = await query;
-      if(error){ console.warn(`Optional table ${table} unavailable: ${error.message}`); return fallback; }
-      return data || fallback;
-    }catch(err){
-      console.warn(`Optional table ${table} unavailable: ${err.message}`);
-      return fallback;
-    }
-  }
-  async function loadActiveTerm(){
-    try{
-      const {data,error}=await state.supabase.from('academic_terms').select('*').eq('active',true).order('created_at',{ascending:false}).limit(1).maybeSingle();
-      if(error) throw error;
-      return data || defaultTerm();
-    }catch(err){
-      console.warn(`Academic term table unavailable: ${err.message}`);
-      return defaultTerm();
-    }
-  }
-
-  async function bootstrap(){
-    const uid=state.session?.user?.id;
-    let {data:profile,error:pErr}=await state.supabase.from('profiles').select('user_id,faculty_id,app_role,active,faculty:faculty_id(id,full_name,designation,email)').eq('user_id',uid).maybeSingle();
-    if(pErr){renderFatal(`Profile lookup failed: ${pErr.message}`);return;}
-    if(!profile){
-      const claim=await state.supabase.rpc('claim_allowed_profile');
-      if(!claim.error && claim.data===true){
-        const retry=await state.supabase.from('profiles').select('user_id,faculty_id,app_role,active,faculty:faculty_id(id,full_name,designation,email)').eq('user_id',uid).maybeSingle();
-        profile=retry.data; pErr=retry.error;
-      }
-    }
-    if(pErr){renderFatal(`Profile lookup failed: ${pErr.message}`);return;}
-    if(!profile || !profile.active){ await state.supabase.auth.signOut(); renderUnauthorized(); return; }
-    state.profile=profile;
-    const base = await Promise.all([
-      state.supabase.from('faculty').select('id,full_name,designation,email').order('full_name'),
-      state.supabase.from('courses').select('*').eq('active',true).order('course_code'),
-      state.supabase.from('primary_assignments').select('*'),
-      state.supabase.from('task_statuses').select('*'),
-      state.supabase.from('task_deadlines').select('*')
-    ]);
-    const err=base.find(x=>x.error)?.error;
-    if(err){renderFatal(`Data could not be loaded: ${err.message}`);return;}
-    const [f,c,a,s,d]=base;
-    state.faculty=f.data||[];state.courses=c.data||[];state.primaryAssignments=a.data||[];state.statuses=s.data||[];state.deadlines=d.data||[];
-    state.term = await loadActiveTerm();
-    const termId = state.term.id;
-    const [weeks,termMilestones,courseSections,courseFaculty,classTests,classTestHistory,courseOutlines,feedbackStatuses,courseFileStatuses,sessionalConfigs,sessionalSessions,assessmentComponents,assessmentInstances,sessionalGradeAssignments,sessionalGradeStatuses,labConfigs,labSessions,labAssessmentTypes,labAssessmentItems,labActivityAssignments,events,notifications] = await Promise.all([
-      selectOptional('academic_weeks', q=>q.select('*').eq('term_id',termId).order('week_no')),
-      selectOptional('term_milestones', q=>q.select('*').eq('term_id',termId).order('milestone_date')),
-      selectOptional('course_sections', q=>q.select('*')),
-      selectOptional('course_faculty', q=>q.select('*')),
-      selectOptional('class_tests', q=>q.select('*').order('date')),
-      selectOptional('class_test_history', q=>q.select('*').order('created_at',{ascending:false})),
-      selectOptional('course_outline_statuses', q=>q.select('*')),
-      selectOptional('feedback_statuses', q=>q.select('*')),
-      selectOptional('course_file_statuses', q=>q.select('*')),
-      selectOptional('sessional_course_configs', q=>q.select('*')),
-      selectOptional('sessional_sessions', q=>q.select('*').order('date')),
-      selectOptional('assessment_components', q=>q.select('*')),
-      selectOptional('assessment_instances', q=>q.select('*').order('due_date')),
-      selectOptional('sessional_grade_assignments', q=>q.select('*')),
-      selectOptional('sessional_grade_statuses', q=>q.select('*')),
-      selectOptional('lab_course_config', q=>q.select('*')),
-      selectOptional('lab_sessions', q=>q.select('*').order('date')),
-      selectOptional('lab_assessment_types', q=>q.select('*')),
-      selectOptional('lab_assessment_items', q=>q.select('*').order('due_date')),
-      selectOptional('lab_activity_assignments', q=>q.select('*')),
-      selectOptional('academic_events', q=>q.select('*').order('event_date')),
-      selectOptional('notifications', q=>q.select('*').order('created_at',{ascending:false}).limit(80))
-    ]);
-    Object.assign(state,{academicWeeks:weeks,termMilestones,courseSections,courseFaculty,classTests,classTestHistory,courseOutlines,feedbackStatuses,courseFileStatuses,sessionalConfigs,sessionalSessions,assessmentComponents,assessmentInstances,sessionalGradeAssignments,sessionalGradeStatuses,labConfigs,labSessions,labAssessmentTypes,labAssessmentItems,labActivityAssignments,events,notifications});
-    if(!state.selectedWeek) state.selectedWeek=state.term.latest_completed_week || 1;
-    state.auditLogs=[];
-    if(isAdmin()){
-      const audit=await state.supabase.from('audit_logs').select('id,actor,table_name,action,row_key,old_value,new_value,created_at').order('created_at',{ascending:false}).limit(80);
-      if(!audit.error) state.auditLogs=audit.data||[];
-    }
-    render();
-  }
-
-  function renderLocked(){
-    $app.innerHTML=`<div class="locked"><div class="locked-card">
-      <p class="eyebrow">Secure deployment not configured</p><h1>BME <span style="color:var(--accent)">Workflow</span></h1>
-      <p>This copy is intentionally locked. No academic data is embedded in the public site. Configure Supabase authentication and Row Level Security before production deployment.</p>
-      <div class="code-note">Production: configure GitHub repository variables SUPABASE_URL and SUPABASE_ANON_KEY.<br>Local anonymous preview: append <b>?demo=1</b> to the URL.</div>
-    </div></div>`;
-  }
-  function renderFatal(msg){$app.innerHTML=`<div class="locked"><div class="locked-card"><p class="eyebrow">System error</p><h1>BME Workflow</h1><div class="notice error">${esc(msg)}</div></div></div>`;}
-  function renderUnauthorized(){ $app.innerHTML=`<div class="locked"><div class="locked-card"><p class="eyebrow">Access denied</p><h1>Unauthorized account</h1><p>Your login succeeded, but this account is not on the approved faculty allowlist. No academic data has been disclosed.</p></div></div>`; }
-
-  function renderAuth(message='', type=''){
-    $app.innerHTML=`<div class="auth-page"><div class="auth-wrap">
-      <div class="auth-brand"><p class="eyebrow">Secure Academic Workflow</p><h1 class="brand">BME <span>Workflow</span></h1><p class="subtitle">Complete faculty academic activity management.</p></div>
-      <div class="auth-grid">
-        <div class="auth-card"><span class="kicker">Existing Account</span><h2>Sign in</h2><p>Use your BME BUET faculty email and the password you set during sign up.</p>
-          <form id="signinForm"><div class="field"><label>Email</label><input type="email" name="email" required autocomplete="username" placeholder="name@bme.buet.ac.bd"><div class="field-help">Only @bme.buet.ac.bd addresses are accepted.</div></div><div class="field"><label>Password</label><input type="password" name="password" required autocomplete="current-password"></div><div class="auth-actions"><button class="btn primary" type="submit">Sign in</button><button class="btn" type="button" id="magicBtn">Email magic link</button></div></form>
-          ${message?`<div class="notice ${esc(type)}">${esc(message)}</div>`:''}
-        </div>
-        <div class="auth-card"><span class="kicker">New Faculty Account</span><h2>Sign up</h2><p>Only a valid institutional address can create an account. After signup, use the same email and password to sign in.</p>
-          <form id="signupForm"><div class="field"><label>Email</label><input type="email" name="email" required autocomplete="username" placeholder="teacher@bme.buet.ac.bd"><div class="field-help">Use any faculty name before @bme.buet.ac.bd.</div></div><div class="field"><label>Set Password</label><input type="password" name="password" required autocomplete="new-password"></div><div class="auth-actions"><button class="btn accent" type="submit">Create account</button></div></form>
-          <div class="notice">Testing shortcut: ${TEST_ADMIN_EMAIL} can sign in with any non-empty password and opens demo admin mode.</div>
-        </div>
-      </div>
-    </div></div>`;
-    document.getElementById('signinForm').addEventListener('submit',signIn);
-    document.getElementById('signupForm').addEventListener('submit',signUp);
-    document.querySelectorAll('[name=email]').forEach(input=>{input.addEventListener('input',()=>validateEmailInput(input));validateEmailInput(input);});
-    document.getElementById('magicBtn').addEventListener('click',magicLink);
-  }
-  function facultyEmailError(email){
-    if(!email) return 'Enter your BME BUET faculty email.';
-    if(!FACULTY_EMAIL_RE.test(email)) return 'Use an address like name@bme.buet.ac.bd.';
-    return '';
-  }
-  function authEmailError(input,email){
-    if(input?.form?.id === 'signinForm' && email.toLowerCase() === TEST_ADMIN_EMAIL) return '';
-    return facultyEmailError(email);
-  }
-  function isTestAdminShortcut(email,password){ return email.toLowerCase() === TEST_ADMIN_EMAIL && password.length > 0; }
-  function validateEmailInput(input){
-    const help=input?.closest('.field')?.querySelector('.field-help'), submit=input?.form?.querySelector('[type="submit"]');
-    if(!input || !help || !submit) return true;
-    const email=input.value.trim();
-    const error=authEmailError(input,email);
-    input.setCustomValidity(error);
-    input.classList.toggle('invalid', !!error && !!email);
-    help.textContent=email.toLowerCase() === TEST_ADMIN_EMAIL ? 'Testing shortcut: opens demo admin mode with any password.' : error || 'This email can be used to sign up or sign in.';
-    help.className=`field-help ${error && email ? 'error' : error ? '' : 'success'}`;
-    submit.disabled=!!error;
-    return !error;
-  }
-  function validateAuthForm(form){
-    const input=form.querySelector('[name=email]');
-    const valid=validateEmailInput(input);
-    if(!valid) form.reportValidity();
-    return valid;
-  }
-  function authCredentials(form){
-    const fd=new FormData(form);
-    return {email:String(fd.get('email') || '').trim().toLowerCase(),password:String(fd.get('password') || '')};
-  }
-  async function signIn(e){
-    e.preventDefault();
-    const {email,password}=authCredentials(e.currentTarget);
-    if(isTestAdminShortcut(email,password)){
-      loadDemo();
-      render();
-      toast('Test admin demo mode enabled. No protected Supabase data was loaded.','success');
-      return;
-    }
-    if(!validateAuthForm(e.currentTarget)) return;
-    const {error}=await state.supabase.auth.signInWithPassword({email,password});
-    if(error)renderAuth(error.message,'error');
-  }
-  async function signUp(e){
-    e.preventDefault();
-    if(!validateAuthForm(e.currentTarget)) return;
-    const {email,password}=authCredentials(e.currentTarget);
-    const redirectTo=location.href.split('?')[0];
-    const {data,error}=await state.supabase.auth.signUp({email,password,options:{emailRedirectTo:redirectTo}});
-    if(error){renderAuth(error.message,'error');return;}
-    if(data.session){await bootstrap();return;}
-    renderAuth('Account created. Check your institutional inbox if Supabase asks for email confirmation, then sign in with the same password.','success');
-  }
-  async function magicLink(){
-    const email=document.querySelector('#signinForm [name=email]').value.trim().toLowerCase();
-    if(facultyEmailError(email)){toast('Enter a valid @bme.buet.ac.bd email first.','error');return;}
-    const redirectTo=location.href.split('?')[0];
-    const {error}=await state.supabase.auth.signInWithOtp({email,options:{emailRedirectTo:redirectTo}});
-    if(error)toast(error.message,'error');else renderAuth('Magic link sent. Check your institutional inbox.','success');
-  }
-
+  function filtered(items){const q=search.trim().toLowerCase();return items.filter(a=>!q||[a.title,a.course.course_code,a.course.title,name(a.owner)].join(' ').toLowerCase().includes(q)).sort(W.sort);}
   function shell(content){
-    const f=state.profile?.faculty || byId(state.faculty,profileFacultyId()) || {};
-    const nav=[['home','H','Home'],['tasks','T','My Tasks'],['courses','C','My Courses'],['ct','CT','CT Calendar'],['calendar','D','Dept Calendar'],['general','G','General'],['workload','W','Workload'],['notifications','N','Notifications']];
-    if(isAdmin()) nav.push(['setup','S','Setup Centre'],['conflicts','!','Conflicts'],['admin','A','Admin']);
-    const term=activeTerm();
-    return `<div class="shell">
-      <header class="topbar"><div><p class="eyebrow">Academic Responsibility Management</p><h1 class="brand">BME <span>Workflow</span></h1><p class="subtitle">Faculty-centered academic activity management across theory, CT, sessional, feedback, and course-file work.</p></div><div class="term-badge"><b>${esc(term.name)}</b>Academic Week ${esc(term.latest_completed_week || 0)} of ${esc(term.total_teaching_weeks || 0)}<br>${state.demo?'DEMO ADMIN':'Authenticated'}</div></header>
-      <div class="app-grid"><aside class="sidebar"><div class="profile-mini"><p class="profile-name">${esc(f.full_name||'Faculty')}</p><div class="profile-meta">${esc(f.designation||'')} | ${esc(state.profile.app_role||'faculty').toUpperCase()}</div></div><nav class="nav">${nav.map(([v,i,l])=>`<button data-nav="${v}" class="${state.view===v?'active':''}"><span>${i}</span>${l}</button>`).join('')}<button id="logoutBtn"><span>Q</span>${state.demo?'Exit Demo':'Logout'}</button></nav></aside><main class="main">${content}</main></div>
-    </div><div id="modalRoot"></div>`;
+    const d=data(),p=store.profile,first=name(fid()).replace(/^Faculty /,'').split(' ')[0],nav=[['home','home','Overview'],['tasks','tasks','My work'],['courses','courses','Courses'],['calendar','calendar','Calendar'],['notifications','bell','Inbox']];
+    if(admin())nav.push(['admin','settings','Manage']);
+    return `<a class="skip-link" href="#main">Skip to content</a><header class="topbar"><a class="wordmark" href="#home" data-nav="home"><span class="brand-symbol"><i></i><i></i><i></i></span>BME<span class="wordmark-light">Workflow</span></a><nav aria-label="Main navigation">${nav.map(([v,i,l])=>`<button class="nav-item ${view===v?'active':''}" data-nav="${v}" ${view===v?'aria-current="page"':''}>${icon(i)}<span>${l}</span></button>`).join('')}</nav><div class="topbar-user"><span class="live-dot"></span><span>${store.demo?'Preview':esc(W.text(p.app_role))}</span><button class="avatar" data-action="account" aria-label="Account and sign out">${esc(first.slice(0,1))}</button></div></header>${store.demo?'<div class="demo-strip">Interactive preview · fictional faculty · changes last for this visit <a href="'+esc(location.pathname)+'">Exit preview '+icon('arrow')+'</a></div>':''}<div class="workspace"><div class="workspace-context"><span>${esc(cfg.institutionName||'Department of Biomedical Engineering')}<span class="context-dot">·</span>BUET</span><label class="term-selector"><span class="sr-only">Academic term</span><select id="term-select">${options((d.terms||[d.term]).map(t=>[t.id,t.name]),d.term?.id)}</select></label></div><main id="main" tabindex="-1">${content}</main><footer><span>BME Workflow<span class="context-dot">·</span>A little clarity. A lot of progress.</span><span>${store.demo?'Preview workspace':'Verified access'} ${icon('shield')}</span></footer></div>`;
   }
-
+  function home(){
+    const items=mine(),attention=items.filter(a=>W.bucket(a)==='attention'),upcoming=items.filter(a=>W.bucket(a)==='upcoming'),done=items.filter(a=>a.finished),pct=W.progress(items),t=data().term;
+    return `<section class="hero"><div><p class="eyebrow">YOUR DAY, IN FOCUS</p><h1>Good ${new Date().getHours()<12?'morning':new Date().getHours()<18?'afternoon':'evening'},<br><span>${esc(name(fid()).replace(/^Faculty /,'').split(' ')[0])}.</span></h1><p>A clear view of what’s next.<br>More room for the work that matters.</p>${button('View my work '+icon('arrow'),'my-work','primary')}</div><div class="hero-art" aria-label="${pct??0} percent of your required activities complete"><div class="orbit orbit-one"></div><div class="orbit orbit-two"></div><div class="progress-orb" style="--progress:${pct||0}"><div><span class="orb-label">YOUR PROGRESS</span><strong>${pct??'—'}<small>${pct===null?'':'%'}</small></strong><span>${done.length} activities complete</span></div></div><span class="floating-note">${icon('check')}One step at a time.</span></div></section><section class="metrics" aria-label="Your activity summary">${[[attention.length,'Needs my action','A good place to start','attention'],[upcoming.length,'Coming up','Your next scheduled work','upcoming'],[items.filter(a=>W.bucket(a)==='waiting').length,'Waiting on others','We’ll show what’s needed','waiting'],[done.length,'Completed','Progress, made visible','completed']].map(([n,l,s,b])=>`<button class="metric" data-bucket-link="${b}"><span>${l}${icon('arrow')}</span><strong>${n.toString().padStart(2,'0')}</strong><small>${s}</small></button>`).join('')}</section><div class="dashboard-grid"><section class="panel focus-panel"><div class="panel-heading"><div><p class="eyebrow">THE NEXT STEP</p><h2>Needs your attention</h2></div><button class="text-button" data-nav="tasks">View all ${icon('arrow')}</button></div>${filtered(attention).slice(0,5).map(taskRow).join('')||empty('You’re all caught up','Your next activities are waiting in Upcoming.')}</section><aside class="panel term-panel"><p class="eyebrow">THE BIGGER PICTURE</p><h2>A term in motion.</h2><p class="muted">${esc(t?.name||'No term configured')}</p><div class="week-display"><strong>${t?.latest_completed_week||0}</strong><span>of ${t?.total_teaching_weeks||14}<br>weeks complete</span></div><div class="week-bars" aria-hidden="true">${Array.from({length:t?.total_teaching_weeks||14},(_,i)=>`<i class="${i<(t?.latest_completed_week||0)?'filled':''}"></i>`).join('')}</div><p class="small muted">${t?.calendar_status==='paused'?'Academic progression is paused. '+esc(t.pause_reason):'Progress follows the approved academic calendar.'}</p><div class="term-next"><span class="mini-label">ON THE HORIZON</span>${upcoming.sort(W.sort).slice(0,2).map(a=>`<button data-activity="${esc(a.id)}"><span class="date-tile">${fmt(a.date)}</span><span><strong>${esc(a.course.course_code)}</strong><small>${esc(a.title)}</small></span></button>`).join('')||'<p class="small muted">No upcoming deadlines.</p>'}</div></aside></div>`;
+  }
+  function tasks(){const items=mine();return header('MAKE SPACE FOR PROGRESS','Your work. One place.','Every assigned activity, from first draft to final handover.')+`<div class="toolbar"><div class="segmented" role="group" aria-label="Task groups">${[['attention','Needs my action'],['waiting','Waiting on others'],['upcoming','Upcoming'],['completed','Completed']].map(([b,l])=>`<button class="${b===bucket?'selected':''}" data-bucket="${b}" aria-pressed="${b===bucket}">${l}<span>${items.filter(a=>W.bucket(a)===b).length}</span></button>`).join('')}</div>${searchBox()}</div><section class="panel task-list">${filtered(items.filter(a=>W.bucket(a)===bucket)).map(taskRow).join('')||empty(search?'No matching activities':'Nothing here just yet',search?'Try a course code or another search.':'Activities appear here when their status changes.')}</section>`;}
+  function searchBox(){return `<label class="search">${icon('search')}<span class="sr-only">Search courses and activities</span><input id="search" placeholder="Search your workspace" value="${esc(search)}" type="search" autocomplete="off"></label>`;}
+  function courses(){
+    const cs=data().courses.filter(c=>admin()||all().some(a=>a.course.id===c.id&&a.owner===fid())||data().courseFaculty.some(r=>r.course_id===c.id&&r.faculty_id===fid())).filter(c=>[c.course_code,c.title].join(' ').toLowerCase().includes(search.toLowerCase()));
+    return header('CONNECTED BY PURPOSE','Your courses.', 'The people, activities, and progress behind each course.',admin()?button(icon('plus')+' Add course','new-course'):searchBox())+`<div class="course-grid">${cs.map((c,i)=>{const items=all().filter(a=>a.course.id===c.id),pct=W.progress(items);return `<button class="course-card tone-${i%4}" data-course="${esc(c.id)}"><div class="course-card-top"><span class="mini-label">${esc(W.text(c.course_type))}</span>${icon('arrow')}</div><span class="course-code">${esc(c.course_code)}</span><h2>${esc(c.title)}</h2><div class="course-card-bottom"><span>${items.length} activities<span class="context-dot">·</span>${esc(c.status)}</span><div class="progress-track"><i style="width:${pct||0}%"></i></div><div class="course-progress"><span>Overall progress</span><strong>${pct??'—'}${pct===null?'':'%'}</strong></div></div></button>`;}).join('')||empty('No courses assigned','Your courses appear after your faculty identity is assigned.')}</div>`;
+  }
+  function course(){
+    const c=data().courses.find(c=>c.id===courseId);if(!c)return empty('Course unavailable');const items=all().filter(a=>a.course.id===c.id),manage=W.manages(data(),c.id,store.profile);
+    return `<button class="text-button back-link" data-nav="courses">← All courses</button>`+header(c.course_code,c.title,`${W.text(c.course_type)} · ${data().term.name} · ${W.text(c.status)}`,admin()?button('Course settings','edit-course'): '')+`<div class="course-summary panel"><div><span class="mini-label">PROGRESS</span><strong>${W.progress(items)??'—'}%</strong></div><div><span class="mini-label">COURSE TEAM</span><p>${esc([...new Set(data().courseFaculty.filter(r=>r.course_id===c.id).map(r=>name(r.faculty_id)))].join(' · ')||'No teachers assigned')}</p></div>${manage?`<div class="actions">${button(icon('plus')+' Class test','new-ct')}${c.course_type!=='theory'?button('Configure activities','generate'):''}</div>`:''}</div><section class="panel"><div class="panel-heading"><h2>Course activity</h2><span class="muted small">${items.filter(a=>a.finished).length} complete · ${items.filter(a=>!a.owner).length} unassigned</span></div>${items.map(taskRow).join('')||empty('Ready for a fresh start','Configure activities for this course.')}</section>`;
+  }
+  function calendar(){
+    const today=W.today(),base=new Date(today+'T12:00:00Z');base.setUTCDate(1);base.setUTCMonth(base.getUTCMonth()+calendarOffset);
+    const year=base.getUTCFullYear(),month=base.getUTCMonth(),prefix=`${year}-${String(month+1).padStart(2,'0')}`,days=new Date(Date.UTC(year,month+1,0)).getUTCDate(),offset=(base.getUTCDay()+6)%7;
+    const events=store.demo?all().filter(a=>a.date).map(a=>({id:a.id,date:a.date,course_code:a.course.course_code,title:a.title,kind:W.LABELS[a.kind],status:a.status})):data().department?.calendar||[];
+    const milestones=(data().termMilestones||[]).filter(m=>!m.course_id).map(m=>({id:m.id,date:m.milestone_date,course_code:'Department',title:W.text(m.milestone_type),kind:'Deadline'}));
+    const listed=events.concat(milestones).filter(e=>e.date?.startsWith(prefix)&&e.status!=='cancelled').sort((a,b)=>a.date.localeCompare(b.date));
+    return header('A SHARED RHYTHM','The department calendar.','Shared schedules, with private work kept private.')+`<section class="panel calendar-panel"><div class="panel-heading"><h2>${base.toLocaleDateString('en-GB',{month:'long',year:'numeric',timeZone:'UTC'})}</h2><div class="actions">${button('←','prev-month','icon-button','aria-label="Previous month"')}${button('Today','this-month')}${button('→','next-month','icon-button','aria-label="Next month"')}</div></div><div class="calendar-grid">${['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].map(d=>`<span class="calendar-day-label">${d}</span>`).join('')}${'<div class="calendar-cell blank"></div>'.repeat(offset)}${Array.from({length:days},(_,i)=>{const date=prefix+'-'+String(i+1).padStart(2,'0');return `<div class="calendar-cell ${date===today?'is-today':''}"><span class="day-number">${i+1}</span>${listed.filter(e=>e.date===date).slice(0,3).map(e=>`<span class="calendar-event" title="${esc(e.title)}">${esc(e.course_code)}</span>`).join('')}${listed.filter(e=>e.date===date).length>3?'<small>+'+(listed.filter(e=>e.date===date).length-3)+' more</small>':''}</div>`;}).join('')}</div></section><section class="panel agenda"><div class="panel-heading"><h2>This month’s agenda</h2><span class="muted small">${listed.length} events</span></div>${listed.map(e=>`<div class="agenda-row"><span class="date-tile">${fmt(e.date)}</span><div><strong>${esc(e.title)}</strong><span>${esc(e.course_code)} · ${esc(e.kind)}</span></div>${badge(e.status||'scheduled')}</div>`).join('')||empty('An open calendar','No events are scheduled for this month.')}</section>`;
+  }
+  function inbox(){return header('STAY IN THE LOOP','A little less chasing.','Updates, handoffs, and requests in one quiet place.')+`<section class="panel">${(data().notifications||[]).map(n=>{const read=data().receipts?.some(r=>r.notification_id===n.id);return `<article class="inbox-row ${read?'read':''}"><span class="task-icon">${icon('bell')}</span><div><h3>${esc(n.title)}</h3><p>${esc(n.body)}</p><small>${esc(n.created_at?new Date(n.created_at).toLocaleString():'Just now')}</small></div>${read?'<span class="small muted">Read</span>':button('Mark read','read-notice','secondary',`data-id="${esc(n.id)}"`)}</article>`;}).join('')||empty('Nothing new','Updates will appear as your work moves forward.')}</section><section class="panel"><div class="panel-heading"><h2>Requests</h2></div>${(data().requests||[]).map(r=>`<div class="inbox-row"><div><h3>${esc(W.text(r.request_type))}</h3><p>${esc(r.reason)}</p><small>${esc(r.status)}${r.resolution?' · '+esc(r.resolution):''}</small></div>${r.status==='pending'&&admin()?button('Review','resolve-request','secondary',`data-id="${esc(r.id)}"`):''}</div>`).join('')||empty('No open requests','Ask for an extension or reassignment from any activity.')}</section>`;}
+  function manage(){
+    const items=all(),missing=items.filter(a=>!a.finished&&!a.cancelled&&(!a.owner||!a.date)),allowed=data().allowed||[];
+    return header('MAKE THE EXCEPTIONS VISIBLE','A smoother department.','Configure ownership once. Keep your attention on what needs it.')+`<div class="admin-actions">${button(icon('plus')+' Faculty approval','new-faculty')}${button(icon('plus')+' Course offering','new-course')}${button('Term & calendar','term')}${button(icon('upload')+' Review CT import','import')}${button('Refresh workspace','refresh')}</div><div class="dashboard-grid"><section class="panel"><div class="panel-heading"><h2>Setup needs attention</h2><span class="count-pill">${missing.length}</span></div>${missing.slice(0,12).map(taskRow).join('')||empty('Setup is looking good')}</section><section class="panel"><div class="panel-heading"><h2>Faculty access</h2><span class="small muted">${data().faculty.length} identities</span></div>${data().faculty.map(f=>{const a=allowed.find(a=>a.faculty_id===f.id);return `<button class="faculty-row" data-faculty="${esc(f.id)}"><span class="avatar">${esc(f.full_name[0])}</span><span><strong>${esc(f.full_name)}</strong><small>${esc(a?.email||f.email||'Email not mapped')}</small></span><span class="badge">${store.demo?'Preview':!a?'Unmapped':a.active?'Approved':'Revoked'}</span></button>`;}).join('')}</section></div><section class="panel"><div class="panel-heading"><h2>Delivery & history</h2></div><div class="health-row"><span>${(data().outbox||[]).filter(x=>x.status==='failed').length} failed deliveries</span><span>${(data().outbox||[]).filter(x=>x.status==='pending').length} queued</span><span>Changes are recorded in the audit log</span></div>${(data().audit||[]).slice(0,12).map(a=>`<div class="audit-row"><span>${esc(W.text(a.table_name))}</span><span>${esc(a.action)}</span><time>${esc(new Date(a.created_at).toLocaleString())}</time></div>`).join('')}</section>`;
+  }
   function render(){
-    if(!activeProfile()){renderUnauthorized();return;}
-    let content='';
-    if(state.courseId) content=renderCourseDetail(state.courseId);
-    else if(state.view==='tasks') content=renderTasks();
-    else if(state.view==='courses') content=renderCourses();
-    else if(state.view==='ct') content=renderCtCalendar();
-    else if(state.view==='calendar') content=renderDepartmentCalendar();
-    else if(state.view==='general') content=renderGeneral();
-    else if(state.view==='workload') content=renderWorkload();
-    else if(state.view==='notifications') content=renderNotifications();
-    else if(state.view==='setup') content=renderSetupCentre();
-    else if(state.view==='conflicts') content=renderConflicts();
-    else if(state.view==='admin') content=renderAdmin();
-    else content=renderHome();
-    $app.innerHTML=shell(content);
-    bindCommon();
-    if(state.modal) renderModal();
+    const content=courseId?course():({home,tasks,courses,calendar,notifications:inbox,admin:manage}[view]||home)();$('#app').innerHTML=shell(content);bind();
   }
-
-  function bindCommon(){
-    document.querySelectorAll('[data-nav]').forEach(b=>b.addEventListener('click',()=>{state.view=b.dataset.nav;state.courseId=null;state.modal=null;render();}));
-    document.querySelectorAll('[data-open-course]').forEach(b=>b.addEventListener('click',()=>{state.courseId=b.dataset.openCourse;render();}));
-    document.querySelectorAll('[data-status-change]').forEach(b=>b.addEventListener('change',e=>updateStatus(e.target.dataset.course,e.target.dataset.task,e.target.value)));
-    document.querySelectorAll('[data-week-select]').forEach(b=>b.addEventListener('click',()=>{state.selectedWeek=Number(b.dataset.weekSelect);render();}));
-    document.querySelectorAll('[data-calendar-filter]').forEach(b=>b.addEventListener('click',()=>{state.calendarFilter=b.dataset.calendarFilter;render();}));
-    document.querySelectorAll('[data-term-action]').forEach(b=>b.addEventListener('click',()=>updateTermAction(b.dataset.termAction)));
-    const form=document.getElementById('termForm'); if(form) form.addEventListener('submit',saveTermSettings);
-    const lo=document.getElementById('logoutBtn'); if(lo) lo.addEventListener('click',async()=>{if(state.demo){location.href=location.pathname;}else await state.supabase.auth.signOut();});
+  function bind(){
+    document.querySelectorAll('[data-nav]').forEach(el=>el.onclick=e=>{e.preventDefault();view=el.dataset.nav;courseId=null;search='';render();$('#main').focus();});
+    document.querySelectorAll('[data-bucket-link]').forEach(el=>el.onclick=()=>{view='tasks';bucket=el.dataset.bucketLink;render();});
+    document.querySelectorAll('[data-bucket]').forEach(el=>el.onclick=()=>{bucket=el.dataset.bucket;render();});
+    document.querySelectorAll('[data-activity]').forEach(el=>el.onclick=()=>editActivity(all().find(a=>a.id===el.dataset.activity)));
+    document.querySelectorAll('[data-course]').forEach(el=>el.onclick=()=>{courseId=el.dataset.course;view='courses';render();});
+    document.querySelectorAll('[data-faculty]').forEach(el=>el.onclick=()=>facultyForm(data().faculty.find(f=>f.id===el.dataset.faculty)));
+    document.querySelectorAll('[data-action]').forEach(el=>el.onclick=()=>action(el.dataset.action,el.dataset));
+    if($('#search'))$('#search').oninput=e=>{const pos=e.target.selectionStart;search=e.target.value;render();$('#search').focus();try{$('#search').setSelectionRange(pos,pos);}catch{}};
+    $('#term-select').onchange=async e=>{store.termId=e.target.value;courseId=null;await refresh();};
   }
-
-  function renderHome(){
-    const theory=myTheoryTasks();
-    const myEvents=myAcademicEvents();
-    const dueWeek=myEvents.filter(e=>daysFromToday(e.date)>=0 && daysFromToday(e.date)<=7 && !['completed','cancelled'].includes(e.status)).length;
-    const todayEvents=myEvents.filter(e=>e.date===todayIso()).slice(0,5);
-    const needs=attentionItems().slice(0,7);
-    const cts=myClassTests().filter(ct=>daysFromToday(ctDate(ct))>=0).sort((a,b)=>(ctDate(a) || '').localeCompare(ctDate(b) || '')).slice(0,5);
-    const sessional=[...myLabSessions(),...myLabItems()].filter(x=>daysFromToday(x.date || x.due_date || x.scheduled_date)>=0).sort((a,b)=>(a.date || a.due_date || a.scheduled_date || '').localeCompare(b.date || b.due_date || b.scheduled_date || '')).slice(0,5);
-    const recent=recentChanges().slice(0,5);
-    return `${renderTermTracker()}<div class="page-head"><div><p class="eyebrow">Personal Home</p><h2>Good ${dayPart()}, ${esc(firstName(state.profile?.faculty?.full_name||facultyName(profileFacultyId())))}</h2><p>Your feed prioritizes what to do next, who is waiting, and what changed recently.</p></div></div>
-      <div class="metrics"><div class="metric"><div class="metric-label">Needs attention</div><div class="metric-value">${needs.length}</div><div class="metric-note">Theory, CT, and sessional items</div></div><div class="metric"><div class="metric-label">Due this week</div><div class="metric-value">${dueWeek}</div><div class="metric-note">Academic Week ${esc(activeTerm().latest_completed_week)}</div></div><div class="metric"><div class="metric-label">Upcoming CTs</div><div class="metric-value">${cts.length}</div><div class="metric-note">Assigned or course-linked</div></div><div class="metric"><div class="metric-label">Sessional activities</div><div class="metric-value">${sessional.length}</div><div class="metric-note">Sessions and assessments</div></div></div>
-      <div class="home-grid"><section class="panel"><div class="panel-title"><h3>Needs Attention</h3><span class="meta">PRIORITY</span></div><div class="stack">${needs.length?needs.map(actionCard).join(''):'<div class="empty">Nothing urgent right now.</div>'}</div></section><section class="panel"><div class="panel-title"><h3>Today</h3><span class="meta">${todayEvents.length} EVENTS</span></div><div class="stack">${todayEvents.length?todayEvents.map(eventCard).join(''):'<div class="empty">No academic events today.</div>'}</div></section><section class="panel"><div class="panel-title"><h3>Upcoming CTs</h3><span class="meta">CALENDAR</span></div><div class="stack">${cts.length?cts.map(ctCard).join(''):'<div class="empty">No upcoming class tests.</div>'}</div></section><section class="panel"><div class="panel-title"><h3>Upcoming Sessional Activities</h3><span class="meta">SESSIONAL</span></div><div class="stack">${sessional.length?sessional.map(labSmallCard).join(''):'<div class="empty">No upcoming sessional activities.</div>'}</div></section><section class="panel"><div class="panel-title"><h3>Recently Changed</h3><span class="meta">AUDIT</span></div><div class="stack">${recent.length?recent.map(changeCard).join(''):'<div class="empty">No recent changes recorded.</div>'}</div></section></div>`;
+  async function refresh(){const token=++refreshToken;try{await store.load();if(token===refreshToken)render();}catch(e){notice(e.message,'error');}}
+  function modal(title,body){
+    priorFocus=document.activeElement;$('#dialog-title').textContent=title;$('#dialog-body').innerHTML=body;
+    if(!$('#dialog').open)$('#dialog').showModal();$('#dialog-body').querySelector('input,select,textarea,button')?.focus();
   }
-
-  function renderTermTracker(){
-    const term=activeTerm(), total=Number(term.total_teaching_weeks || 14), latest=Number(term.latest_completed_week || 0), remaining=Math.max(total-latest,0), pct=total ? Math.round(latest/total*100) : 0;
-    const selected=state.selectedWeek || latest || 1;
-    return `<section class="term-tracker panel"><div class="term-summary"><div><p class="eyebrow">Term Week Tracker</p><h2>${esc(term.name)}</h2><p>Week ${esc(latest)} of ${esc(total)} completed. Calendar is ${esc(term.calendar_status || 'active')}${term.pause_reason ? `: ${esc(term.pause_reason)}` : ''}.</p></div><div class="term-stats"><div><b>${esc(latest)} / ${esc(total)}</b><span>teaching weeks completed</span></div><div><b>${esc(remaining)}</b><span>weeks remaining</span></div><div><b>${esc(pct)}%</b><span>term progress</span></div></div></div>
-      <div class="week-strip">${Array.from({length:total},(_,i)=>weekCell(i+1,latest,selected)).join('')}</div>
-      <div class="week-footer"><div class="progress"><span style="width:${pct}%"></span></div>${isAdmin()?`<div class="toolbar"><button class="btn small" data-term-action="previous">Previous Week</button><button class="btn small accent" data-term-action="advance">Advance Week</button><button class="btn small" data-term-action="${term.calendar_status==='paused'?'resume':'pause'}">${term.calendar_status==='paused'?'Resume Calendar':'Pause Calendar'}</button></div>`:''}</div>
-      ${renderWeekPlanner(selected)}</section>`;
-  }
-  function weekCell(n,latest,selected){
-    const cls=n===selected?'selected':n<latest?'past':n===latest?'latest':'future';
-    return `<button class="week-cell ${cls}" data-week-select="${n}"><b>${n}</b><span>${n<latest?'Done':n===latest?'Latest':'Future'}</span></button>`;
-  }
-  function renderWeekPlanner(weekNo){
-    const events=eventsForAll().filter(e=>e.week===weekNo).slice(0,6);
-    return `<div class="week-planner"><div><p class="eyebrow">Academic Week ${esc(weekNo)}</p><h3>Light Planner</h3></div><div class="mini-event-list">${events.length?events.map(e=>`<div class="mini-event" data-open-course="${esc(e.courseId)}"><b>${esc(e.type)}</b><span>${esc(e.course?.course_code || '')} | ${esc(e.title)} | ${fmtDate(e.date)}</span></div>`).join(''):'<div class="empty compact">No CTs, sessional activities, or deadlines mapped to this week.</div>'}</div></div>`;
-  }
-
-  function renderTasks(){
-    let rows=[
-      ...myTheoryTasks().map(t=>({kind:'Theory', title:t.label, course:t.course, date:t.due_date, status:t.status, assignee:t.assignee_id, raw:t})),
-      ...myClassTests().map(ct=>({kind:'Class Test', title:ct.title || `CT ${ct.ct_number || ''}`, course:courseById(ct.course_id), date:ctDate(ct), status:ct.status || 'not_planned', assignee:ct.responsible_faculty || ct.responsible_faculty_id, raw:ct})),
-      ...myLabSessions().map(s=>({kind:'Sessional Session', title:`Session ${s.session_no || s.sequence_number || ''} - ${s.title}`, course:courseById(s.course_id), date:s.date || s.scheduled_date, status:s.status, assignee:s.assigned_faculty, raw:s})),
-      ...myLabItems().map(i=>({kind:'Sessional Assessment', title:i.title, course:courseById(i.course_id), date:i.due_date || i.scheduled_date, status:i.status, assignee:i.responsible_faculty, raw:i})),
-      ...state.courseOutlines.filter(o=>courseIsMine(courseById(o.course_id))).map(o=>({kind:'Course Outline', title:'Course outline sharing', course:courseById(o.course_id), date:o.due_date || milestoneDate('COURSE_OUTLINE_SHARING'), status:o.status || 'not_started', assignee:o.responsible_faculty, raw:o})),
-      ...state.feedbackStatuses.filter(f=>courseIsMine(courseById(f.course_id))).map(f=>({kind:'Feedback', title:'Student feedback', course:courseById(f.course_id), date:f.deadline || milestoneDate('FEEDBACK_DEADLINE'), status:f.status || 'not_started', assignee:f.responsible_faculty, raw:f})),
-      ...state.courseFileStatuses.filter(cf=>courseIsMine(courseById(cf.course_id))).map(cf=>({kind:'Course File / CAR', title:'Course File / CAR', course:courseById(cf.course_id), date:cf.deadline || milestoneDate('CAR_DEADLINE'), status:cf.status || 'not_started', assignee:cf.responsible_faculty, raw:cf}))
-    ];
-    if(state.search){const q=state.search.toLowerCase();rows=rows.filter(t=>`${t.kind} ${t.course.course_code} ${t.course.title} ${t.title}`.toLowerCase().includes(q));}
-    if(state.statusFilter!=='all') rows=rows.filter(t=>t.status===state.statusFilter);
-    rows.sort((a,b)=>prioritySort({status:a.status,due_date:a.date},{status:b.status,due_date:b.date}));
-    const statusOptions={...STATUS_LABEL,...CT_STATUS_LABEL,...SESSIONAL_STATUS_LABEL,...OUTLINE_STATUS_LABEL};
-    return `<div class="page-head"><div><p class="eyebrow">Personal Responsibility Queue</p><h2>My Tasks</h2><p>Theory workflow tasks, class tests, sessional sessions, and sessional assessments in one list.</p></div><div class="toolbar"><input id="taskSearch" class="search" placeholder="Search course or responsibility" value="${esc(state.search)}"><select id="statusFilter" class="select"><option value="all">All statuses</option>${Object.entries(statusOptions).map(([v,l])=>`<option value="${v}" ${state.statusFilter===v?'selected':''}>${l}</option>`).join('')}</select></div></div>
-      <section class="panel"><div class="stack">${rows.length?rows.map(unifiedTaskCard).join(''):'<div class="empty">No tasks match this filter.</div>'}</div></section>`;
-  }
-
-  function renderCourses(){
-    const mine=state.courses.filter(courseIsMine);
-    const theory=mine.filter(isTheoryCourse), sessional=mine.filter(isSessionalCourse);
-    return `<div class="page-head"><div><p class="eyebrow">Personal Course Feed</p><h2>My Courses</h2><p>Theory and sessional courses are separated because their workflows are intentionally different.</p></div></div>
-      <section class="panel"><div class="panel-title"><h3>Theory Courses</h3><span class="meta">${theory.length} ACTIVE</span></div><div class="course-grid">${theory.map(c=>courseCard(c,true)).join('')||'<div class="empty">No assigned theory courses.</div>'}</div></section>
-      <section class="panel"><div class="panel-title"><h3>Sessional Courses</h3><span class="meta">${sessional.length} ACTIVE</span></div><div class="course-grid">${sessional.map(c=>courseCard(c,true)).join('')||'<div class="empty">No assigned sessional courses.</div>'}</div></section>`;
-  }
-
-  function renderGeneral(){
-    const all=taskObjects(), events=eventsForAll(), pct=progressPct(all), pending=all.filter(t=>t.status!=='completed').length;
-    const ctWeek=state.classTests.filter(ct=>daysFromToday(ctDate(ct))>=0 && daysFromToday(ctDate(ct))<=7).length;
-    const sessionalPending=[...(state.sessionalSessions.length ? state.sessionalSessions : state.labSessions),...(state.assessmentInstances.length ? state.assessmentInstances : state.labAssessmentItems)].filter(x=>!['completed','cancelled','marks_uploaded'].includes(x.status)).length;
-    const outlinesShared=state.courseOutlines.filter(x=>x.status==='shared_with_students').length;
-    const feedbackDone=state.feedbackStatuses.filter(x=>x.status==='completed').length;
-    const carDone=state.courseFileStatuses.filter(x=>x.status==='uploaded' || x.status==='completed').length;
-    const overdue=events.filter(e=>e.date < todayIso() && !['completed','conducted','cancelled'].includes(e.status)).length;
-    return `${renderTermTracker()}<div class="page-head"><div><p class="eyebrow">Department Summary</p><h2>General Overview</h2><p>Operational progress only. No question-paper content is exposed.</p></div></div><div class="metrics"><div class="metric"><div class="metric-label">Theory courses</div><div class="metric-value">${theoryCourses().length}</div><div class="metric-note">${pending} pending theory tasks</div></div><div class="metric"><div class="metric-label">Sessional courses</div><div class="metric-value">${labCourses().length}</div><div class="metric-note">${sessionalPending} pending activities</div></div><div class="metric"><div class="metric-label">CTs this week</div><div class="metric-value">${ctWeek}</div><div class="metric-note">Workbook CT lifecycle</div></div><div class="metric"><div class="metric-label">Outlines shared</div><div class="metric-value">${outlinesShared}/${state.courseOutlines.length || state.courses.length}</div><div class="metric-note">Global deadline ${fmtDate(milestoneDate('COURSE_OUTLINE_SHARING'))}</div></div></div>
-      <div class="metrics"><div class="metric"><div class="metric-label">Theory progress</div><div class="metric-value">${pct}%</div><div class="metric-note">${all.filter(t=>t.status==='completed').length} of ${all.length} tasks</div></div><div class="metric"><div class="metric-label">Feedback</div><div class="metric-value">${feedbackDone}/${state.feedbackStatuses.length || state.courses.length}</div><div class="metric-note">Student feedback workflow</div></div><div class="metric"><div class="metric-label">Course File / CAR</div><div class="metric-value">${carDone}/${state.courseFileStatuses.length || state.courses.length}</div><div class="metric-note">Archive readiness</div></div><div class="metric"><div class="metric-label">At risk</div><div class="metric-value">${overdue}</div><div class="metric-note">Overdue event signals</div></div></div>
-      <div class="attention"><section class="panel"><div class="panel-title"><h3>Completion by Stage</h3><span class="meta">THEORY</span></div>${STAGE_ORDER.map(stage=>stageProgress(stage)).join('')}</section><section class="panel"><div class="panel-title"><h3>Course Health</h3><span class="meta">${overdue} OVERDUE SIGNALS</span></div><div class="health-list">${state.courses.map(healthItem).join('')}</div></section></div>`;
-  }
-
-  function renderCourseDetail(id){
-    const c=byId(state.courses,id); if(!c){state.courseId=null;return renderHome();}
-    return isSessionalCourse(c) ? renderSessionalCourseDetail(c) : renderTheoryCourseDetail(c);
-  }
-  function renderTheoryCourseDetail(c){
-    const tasks=TASKS.map(t=>({...t,course:c,assignee_id:assigneeFor(c.id,t.key),status:statusFor(c,t.key),due_date:dueDateFor(c,t.key)}));
-    const stages=STAGE_ORDER.map(stage=>({stage,tasks:tasks.filter(t=>t.stage===stage)}));
-    const cts=classTestsFor(c.id);
-    return `<div class="page-head"><div><button class="btn small" id="backCourse">Back</button><p class="eyebrow" style="margin-top:15px">${esc(c.course_code)} | Theory | Academic Week ${esc(activeTerm().latest_completed_week)}</p><h2>${esc(c.title)}</h2><p>Question milestone: ${fmtDate(c.question_deadline)} | Final gradesheet milestone: ${fmtDate(c.final_gradesheet_deadline)}</p></div><div>${statusBadge(progressPct(tasks)===100?'completed':'in_progress')}</div></div>
-      <section class="panel"><div class="panel-title"><h3>Theory Workflow</h3><span class="meta">${progressPct(tasks)}% COMPLETE</span></div><div class="workflow">${stages.map((s,i)=>workflowStage(s,i)).join('')}</div></section>
-      ${renderCourseOutline(c)}
-      <section class="panel"><div class="panel-title"><h3>Class Tests</h3><span class="meta">${cts.length} CT ITEMS</span></div><div class="stack">${cts.length?cts.map(ctCard).join(''):'<div class="empty">No class tests scheduled for this course.</div>'}</div></section>`;
-  }
-  function renderSessionalCourseDetail(c){
-    const config=labConfigFor(c.id), sessions=labSessionsFor(c.id), types=assessmentComponentsFor(c.id), items=labItemsFor(c.id);
-    return `<div class="page-head"><div><button class="btn small" id="backCourse">Back</button><p class="eyebrow" style="margin-top:15px">${esc(c.course_code)} | Sessional ${c.sessional_subtype?`| ${esc(c.sessional_subtype)}`:''} | Academic Week ${esc(activeTerm().latest_completed_week)}</p><h2>${esc(c.title)}</h2><p>Sessional courses use configurable sessions, assessments, and gradesheet workflow instead of the theory exam workflow.</p></div>${statusBadge(config.config_status || 'setup_required', SESSIONAL_STATUS_LABEL)}</div>
-      <div class="metrics"><div class="metric"><div class="metric-label">Sessions</div><div class="metric-value">${sessions.length || config.session_count || 0}</div><div class="metric-note">${progressPct(sessions)}% conducted/completed</div></div><div class="metric"><div class="metric-label">Assessment types</div><div class="metric-value">${types.length}</div><div class="metric-note">Reports, quiz, viva, test, final, custom</div></div><div class="metric"><div class="metric-label">Assessment items</div><div class="metric-value">${items.length}</div><div class="metric-note">${progressPct(items)}% complete</div></div><div class="metric"><div class="metric-label">Version</div><div class="metric-value">${config.version || 1}</div><div class="metric-note">Config changes are audited</div></div></div>
-      ${renderCourseOutline(c)}
-      <section class="panel"><div class="panel-title"><h3>Assessment Components</h3><span class="meta">CONFIGURABLE</span></div>${types.length?`<div class="table-wrap"><table class="table"><thead><tr><th>Component</th><th>Marks</th><th>Count</th><th>Best/Drop</th><th>Scope</th><th>Responsible</th></tr></thead><tbody>${types.map(t=>`<tr><td>${esc(t.name)}</td><td>${esc(t.marks_each || t.marks || 0)}</td><td>${esc(t.quantity || t.count || 1)}</td><td>${esc(t.counted_quantity || t.best_of || t.quantity || t.count || 1)}</td><td>${esc(t.scope || t.section || 'Entire Course')}</td><td>${esc(facultyName(t.responsible_faculty))}</td></tr>`).join('')}</tbody></table></div>`:'<div class="empty">No assessment components configured yet.</div>'}</section>
-      <section class="panel"><div class="panel-title"><h3>Sessional Sessions</h3><span class="meta">SESSION 01...N</span></div><div class="stack">${sessions.length?sessions.map(labSmallCard).join(''):'<div class="empty">No sessional sessions generated yet.</div>'}</div></section>
-      <section class="panel"><div class="panel-title"><h3>Assessment Items</h3><span class="meta">LINKED TO SESSIONS</span></div><div class="stack">${items.length?items.map(labSmallCard).join(''):'<div class="empty">No assessment items generated yet.</div>'}</div></section>`;
-  }
-  function renderCourseOutline(c){
-    const outline=state.courseOutlines.find(o=>o.course_id===c.id) || {};
-    const due=outline.due_date || milestoneDate('COURSE_OUTLINE_SHARING');
-    return `<section class="panel"><div class="panel-title"><h3>Course Outline</h3><span class="meta">GLOBAL DEADLINE ${fmtDate(due)}</span></div><div class="health-item"><div class="health-main"><span class="health-dot ${outline.status==='shared_with_students'?'done':outline.status==='prepared'?'green':'yellow'}"></span><div><b>${esc(OUTLINE_STATUS_LABEL[outline.status || 'not_started'])}</b><div style="font-size:10px;color:var(--ink-soft)">Workflow: Under Preparation -> Prepared -> Shared with Students</div></div></div>${statusBadge(outline.status || 'not_started',OUTLINE_STATUS_LABEL)}</div></section>`;
-  }
-
-  function renderCtCalendar(){
-    const tests=[...state.classTests].sort((a,b)=>(ctDate(a) || '').localeCompare(ctDate(b) || '') || ctTime(a).localeCompare(ctTime(b)));
-    const conflicts=findCtConflicts();
-    return `<div class="page-head"><div><p class="eyebrow">Class Test Module</p><h2>CT Calendar</h2><p>Month/week/batch/course views can be represented through the filters below. Conflict detection uses batch, section, date, and time.</p></div></div>
-      <div class="metrics"><div class="metric"><div class="metric-label">CT records</div><div class="metric-value">${tests.length}</div><div class="metric-note">Any count, not CT1-CT5 columns</div></div><div class="metric"><div class="metric-label">Marks published</div><div class="metric-value">${tests.filter(t=>['marks_published','completed'].includes(t.status)).length}</div><div class="metric-note">Final CT lifecycle stage</div></div><div class="metric"><div class="metric-label">Recent changes</div><div class="metric-value">${state.classTestHistory.length}</div><div class="metric-note">Reschedule history</div></div><div class="metric"><div class="metric-label">Conflicts</div><div class="metric-value">${conflicts.length}</div><div class="metric-note">Same slot overlap</div></div></div>
-      <section class="panel"><div class="panel-title"><h3>Class Tests</h3><span class="meta">BATCH / COURSE / MY COURSES</span></div><div class="calendar-list">${tests.map(ctCard).join('')||'<div class="empty">No class tests yet.</div>'}</div></section>
-      <section class="panel"><div class="panel-title"><h3>CT Conflicts</h3><span class="meta">AUTOMATIC</span></div>${conflicts.map(x=>conflictBox(x,true)).join('') || '<div class="empty">No CT schedule conflicts detected.</div>'}</section>`;
-  }
-
-  function renderDepartmentCalendar(){
-    let events=eventsForAll();
-    if(state.calendarFilter!=='all') events=events.filter(e=>e.type===state.calendarFilter);
-    const filters=['all','Theory Deadline','Class Test','Sessional Session','Sessional Assessment','Course Outline','Feedback','Course File','Deadline'];
-    return `<div class="page-head"><div><p class="eyebrow">Universal Academic Events</p><h2>Department Calendar</h2><p>Shared event layer for theory deadlines, CTs, sessional activities, feedback, course files, and term milestones.</p></div><div class="toolbar">${filters.map(f=>`<button class="btn small ${state.calendarFilter===f?'primary':''}" data-calendar-filter="${esc(f)}">${esc(f)}</button>`).join('')}</div></div>
-      <section class="panel"><div class="calendar-list">${events.map(eventCard).join('')||'<div class="empty">No events match this filter.</div>'}</div></section>`;
-  }
-
-  function renderWorkload(){
-    const rows=state.faculty.map(f=>{
-      const theory=taskObjects().filter(t=>t.assignee_id===f.id && t.status!=='completed').length;
-      const ct=state.classTests.filter(c=>(c.responsible_faculty===f.id || c.responsible_faculty_id===f.id) && !['completed','marks_published','cancelled'].includes(c.status)).length;
-      const sessional=(state.sessionalSessions.length ? state.sessionalSessions : state.labSessions).filter(s=>s.assigned_faculty===f.id && !['completed','cancelled'].includes(s.status)).length + (state.assessmentInstances.length ? state.assessmentInstances : state.labAssessmentItems).filter(i=>i.responsible_faculty===f.id && !['completed','cancelled','marks_uploaded'].includes(i.status)).length;
-      return {...f,theory,ct,sessional,total:theory+ct+sessional};
-    }).sort((a,b)=>b.total-a.total);
-    return `<div class="page-head"><div><p class="eyebrow">Faculty Workload</p><h2>Workload View</h2><p>Counts current unfinished ownership across theory tasks, CTs, and sessional activities.</p></div></div><section class="panel"><div class="table-wrap"><table class="table"><thead><tr><th>Faculty</th><th>Theory</th><th>CT</th><th>Sessional</th><th>Total</th></tr></thead><tbody>${rows.map(r=>`<tr><td><b>${esc(r.full_name)}</b><br><span style="color:var(--ink-soft)">${esc(r.designation || '')}</span></td><td>${r.theory}</td><td>${r.ct}</td><td>${r.sessional}</td><td><b>${r.total}</b></td></tr>`).join('')}</tbody></table></div></section>`;
-  }
-
-  function renderSetupCentre(){
-    if(!isAdmin()) return '<div class="empty">Administrator permission required.</div>';
-    const inferred=state.courses.filter(c=>!c.course_type).length;
-    const sessionalNeed=labCourses().filter(c=>(labConfigFor(c.id).config_status || 'setup_required') !== 'configured').length;
-    const outlineMissing=state.courseOutlines.filter(o=>o.status!=='shared_with_students').length || Math.max(state.courses.length-state.courseOutlines.length,0);
-    const warnings=setupWarnings();
-    return `<div class="page-head"><div><p class="eyebrow">Setup Centre</p><h2>Term and Course Setup</h2><p>Administrative readiness checks for the active term, course type, sections, CTs, outlines, feedback, CAR, and sessional configuration.</p></div></div>
-      <div class="setup-grid"><div class="setup-card"><b>Academic term</b><span>${esc(activeTerm().name)} | Week ${esc(activeTerm().latest_completed_week)} of ${esc(activeTerm().total_teaching_weeks)}</span></div><div class="setup-card"><b>Explicit course type</b><span>${inferred ? `${inferred} inferred from odd/even code` : 'All courses have explicit type'}</span></div><div class="setup-card"><b>Sessional setup</b><span>${sessionalNeed ? `${sessionalNeed} sessional course(s) need setup` : 'All sessional courses configured'}</span></div><div class="setup-card"><b>Outline sharing</b><span>${outlineMissing ? `${outlineMissing} outline record(s) need attention` : 'All outlines shared'}</span></div></div>
-      <section class="panel"><div class="panel-title"><h3>Smart Warnings</h3><span class="meta">${warnings.length} SIGNALS</span></div>${warnings.map(x=>conflictBox(x,true)).join('') || '<div class="empty">No setup warnings detected.</div>'}</section>
-      <section class="panel"><div class="panel-title"><h3>Course Readiness</h3><span class="meta">ADMIN REVIEW</span></div><div class="table-wrap"><table class="table"><thead><tr><th>Course</th><th>Type</th><th>Sections</th><th>Setup</th><th>Health</th></tr></thead><tbody>${state.courses.map(c=>`<tr><td><b>${esc(c.course_code)}</b><br>${esc(c.title)}</td><td>${typeBadge(c)}</td><td>${esc(sectionsFor(c.id).join(', ') || 'X')}</td><td>${isSessionalCourse(c)?statusBadge(labConfigFor(c.id).config_status || 'setup_required',SESSIONAL_STATUS_LABEL):statusBadge(c.status==='published'?'completed':'waiting')}</td><td>${esc(courseHealth(c).label)}</td></tr>`).join('')}</tbody></table></div></section>`;
-  }
-
-  function renderNotifications(){
-    const items=notificationItems();
-    return `<div class="page-head"><div><p class="eyebrow">Action Signals</p><h2>Notifications</h2><p>Generated from assignments, deadlines, week changes, CT changes, and sessional activities.</p></div></div><section class="panel"><div class="panel-title"><h3>Current Notifications</h3><span class="meta">${items.length} ACTIVE</span></div><div class="stack">${items.length?items.map(n=>`<article class="task-card" ${n.courseId?`data-open-course="${esc(n.courseId)}"`:''}><div class="task-top"><div><div class="task-role">${esc(n.title)}</div><div class="task-title">${esc(n.detail)}</div></div>${statusBadge(n.level)}</div></article>`).join(''):'<div class="empty">Nothing currently needs a notification.</div>'}</div></section>`;
-  }
-
-  function renderConflicts(){
-    if(!isAdmin()) return '<div class="empty">Administrator permission required.</div>';
-    const {errors,warnings}=findConflicts();
-    return `<div class="page-head"><div><p class="eyebrow">Fail-safe Center</p><h2>Conflicts</h2><p>Hard errors must be fixed. Warnings require administrative review but may be legitimate.</p></div></div><div class="metrics"><div class="metric"><div class="metric-label">Hard errors</div><div class="metric-value">${errors.length}</div><div class="metric-note">Cannot be published in production</div></div><div class="metric"><div class="metric-label">Warnings</div><div class="metric-value">${warnings.length}</div><div class="metric-note">Review recommended</div></div></div><section class="panel"><div class="panel-title"><h3>Validation Results</h3><span class="meta">${state.courses.length} COURSES CHECKED</span></div>${errors.map(x=>conflictBox(x,false)).join('')}${warnings.map(x=>conflictBox(x,true)).join('')||(!errors.length?'<div class="empty">No conflicts or warnings detected.</div>':'')}</section>`;
-  }
-
-  function renderAdmin(){
-    if(!isAdmin()) return '<div class="empty">Administrator permission required.</div>';
-    return `<div class="page-head"><div><p class="eyebrow">Administrator Workspace</p><h2>Admin</h2><p>Term controls, assignment matrix, and immutable audit trail.</p></div></div>${renderTermAdmin()}
-      <section class="panel"><div class="panel-title"><h3>Theory Assignment Matrix</h3><span class="meta">DERIVED ROLES LOCKED</span></div><div class="table-wrap"><table class="table"><thead><tr><th>Course</th><th>QP-A</th><th>QP-B</th><th>Moderator 1</th><th>Moderator 2</th><th>Scrutinizer</th><th></th></tr></thead><tbody>${theoryCourses().map(c=>adminRow(c)).join('')}</tbody></table></div></section>
-      <section class="panel"><div class="panel-title"><h3>Recent Audit Trail</h3><span class="meta">IMMUTABLE LOG</span></div>${renderAuditTable()}</section>`;
-  }
-  function renderTermAdmin(){
-    const t=activeTerm();
-    return `<section class="panel"><div class="panel-title"><h3>Academic Term Controls</h3><span class="meta">MANUAL CALENDAR</span></div><form id="termForm"><div class="form-grid"><div class="field"><label>Term Name</label><input name="name" value="${esc(t.name)}"></div><div class="field"><label>Number of Teaching Weeks</label><input name="total_teaching_weeks" type="number" min="1" max="52" value="${esc(t.total_teaching_weeks || 14)}"></div><div class="field"><label>Latest Completed Week</label><input name="latest_completed_week" type="number" min="0" max="52" value="${esc(t.latest_completed_week || 0)}"></div><div class="field"><label>Calendar Status</label><select name="calendar_status"><option value="active" ${t.calendar_status!=='paused'?'selected':''}>Active</option><option value="paused" ${t.calendar_status==='paused'?'selected':''}>Paused</option></select></div><div class="field span-2"><label>Pause Reason</label><input name="pause_reason" value="${esc(t.pause_reason || '')}" placeholder="Strike, closure, emergency, make-up week..."></div><div class="span-2 auth-actions"><button class="btn accent" type="submit">Save Term Settings</button><button class="btn" type="button" data-term-action="previous">Previous Week</button><button class="btn" type="button" data-term-action="advance">Advance Week</button><button class="btn" type="button" data-term-action="${t.calendar_status==='paused'?'resume':'pause'}">${t.calendar_status==='paused'?'Resume Calendar':'Pause Calendar'}</button></div></div></form></section>`;
-  }
-  function renderAuditTable(){
-    if(!state.auditLogs.length) return '<div class="empty">No audit records available yet.</div>';
-    return `<div class="table-wrap"><table class="table"><thead><tr><th>Time</th><th>Area</th><th>Action</th><th>Record</th></tr></thead><tbody>${state.auditLogs.slice(0,30).map(l=>`<tr><td>${esc(new Date(l.created_at).toLocaleString('en-GB',{timeZone:'Asia/Dhaka'}))}</td><td>${esc(l.table_name)}</td><td>${esc(l.action)}</td><td>${esc(l.row_key||'-')}</td></tr>`).join('')}</tbody></table></div>`;
-  }
-
-  function actionCard(item){
-    return `<article class="task-card" data-open-course="${esc(item.courseId)}"><div class="task-top"><div><div class="task-course">${esc(item.kind)}</div><div class="task-role">${esc(item.title)}</div><div class="task-title">${esc(item.detail)}</div></div>${statusBadge(item.status, {...STATUS_LABEL,...CT_STATUS_LABEL,...SESSIONAL_STATUS_LABEL,...OUTLINE_STATUS_LABEL})}</div><div class="task-foot"><span>${item.date?`Due ${fmtDate(item.date)}`:'No date set'}</span><span>Academic Week ${esc(item.week || '-')}</span></div></article>`;
-  }
-  function unifiedTaskCard(t){
-    const canEdit=t.kind==='Theory' && (state.demo || t.assignee===profileFacultyId() || isAdmin());
-    const options=['not_started','in_progress','submitted','completed'].map(s=>`<option value="${s}" ${(statusRow(t.course.id,t.raw.key)?.status||'not_started')===s?'selected':''}>${STATUS_LABEL[s]}</option>`).join('');
-    return `<article class="task-card" data-open-course="${esc(t.course.id)}"><div class="task-top"><div><div class="task-course">${esc(t.kind)} | ${esc(t.course.course_code || '')}</div><div class="task-role">${esc(t.title)}</div><div class="task-title">${esc(t.course.title || '')}</div></div>${statusBadge(t.status,{...STATUS_LABEL,...CT_STATUS_LABEL,...SESSIONAL_STATUS_LABEL,...OUTLINE_STATUS_LABEL})}</div><div class="task-foot"><span>${t.date?`Due ${fmtDate(t.date)}`:'No date set'}</span>${canEdit?`<select class="select" data-status-change data-course="${esc(t.course.id)}" data-task="${esc(t.raw.key)}" onclick="event.stopPropagation()">${options}</select>`:`<span>${esc(facultyName(t.assignee))}</span>`}</div></article>`;
-  }
-  function ctCard(ct){
-    const c=courseById(ct.course_id);
-    return `<article class="task-card" data-open-course="${esc(ct.course_id)}"><div class="task-top"><div><div class="task-course">Class Test | ${esc(c.course_code || '')}</div><div class="task-role">${esc(ct.title || `CT ${ct.ct_number || ''}`)} - Section ${esc(ct.section || 'All')}</div><div class="task-title">${esc(ct.syllabus || (ctDate(ct) ? 'Syllabus not set' : 'Status exists but no CT date has been recorded.'))}</div></div>${statusBadge(ct.status || 'not_planned',CT_STATUS_LABEL)}</div><div class="task-foot"><span>${ctDate(ct)?`${fmtDate(ctDate(ct))} ${esc(ctTime(ct))}`:'Date missing'}</span><span>${esc(facultyName(ct.responsible_faculty || ct.responsible_faculty_id))}</span></div></article>`;
-  }
-  function labSmallCard(item){
-    const isSession='session_no' in item, c=courseById(item.course_id), date=item.date || item.due_date || item.scheduled_date;
-    const title=isSession ? `Session ${item.session_no || item.sequence_number || ''} - ${item.title}` : item.title;
-    const responsible=isSession ? item.assigned_faculty : item.responsible_faculty;
-    return `<article class="task-card" data-open-course="${esc(item.course_id)}"><div class="task-top"><div><div class="task-course">${isSession?'Sessional Session':'Sessional Assessment'} | ${esc(c.course_code || '')}</div><div class="task-role">${esc(title)}</div><div class="task-title">${esc(isSession ? `${item.section || item.scope || 'Entire Course'} ${item.group_label || ''}` : `${item.marks || item.marks_each || 0} marks`)}</div></div>${statusBadge(item.status,SESSIONAL_STATUS_LABEL)}</div><div class="task-foot"><span>${fmtDate(date)}</span><span>${esc(facultyName(responsible))}</span></div></article>`;
-  }
-  function eventCard(e){
-    return `<article class="event-row" data-open-course="${esc(e.courseId)}"><div class="event-date"><b>${fmtDate(e.date)}</b><span>${esc(e.time || `Week ${e.week || '-'}`)}</span></div><div><div class="task-course">${esc(e.type)} | ${esc(e.course?.course_code || '')}</div><div class="task-role">${esc(e.title)}</div><div class="task-title">${esc(e.detail)}</div></div>${statusBadge(e.status,{...STATUS_LABEL,...CT_STATUS_LABEL,...SESSIONAL_STATUS_LABEL,...OUTLINE_STATUS_LABEL})}</article>`;
-  }
-  function changeCard(item){
-    return `<article class="task-card"><div class="task-top"><div><div class="task-course">${esc(item.kind)}</div><div class="task-role">${esc(item.title)}</div><div class="task-title">${esc(item.detail)}</div></div>${statusBadge(item.level)}</div></article>`;
-  }
-  function courseCard(c,personal=false){
-    const health=courseHealth(c);
-    const progress=courseProgress(c);
-    const roles=courseTeachers(c.id).map(r=>`${r.role.replace(/_/g,' ')} ${r.section ? `(${r.section})` : ''}`);
-    const mine=isTheoryCourse(c) ? TASKS.filter(t=>assigneeFor(c.id,t.key)===profileFacultyId()).map(t=>t.short) : roles;
-    return `<article class="course-card" data-open-course="${esc(c.id)}"><div class="course-card-head"><div><div class="course-code">${esc(c.course_code)}</div><div class="course-name">${esc(c.title)}</div></div>${typeBadge(c)}</div>${personal?`<div class="course-roles">${mine.map(t=>`<span class="role-chip">${esc(t)}</span>`).join('')}</div>`:''}<div class="progress-row"><span>${esc(health.label)}</span><span>${progress}%</span></div><div class="progress"><span style="width:${progress}%"></span></div></article>`;
-  }
-  function stageProgress(stage){
-    const tasks=taskObjects().filter(t=>t.stage===stage), pct=progressPct(tasks);
-    return `<div class="stage-row"><div class="stage-name">${esc(stage)}</div><div class="progress"><span style="width:${pct}%"></span></div><div class="stage-pct">${pct}%</div></div>`;
-  }
-  function healthItem(c){
-    const h=courseHealth(c);
-    return `<div class="health-item" data-open-course="${esc(c.id)}"><div class="health-main"><span class="health-dot ${h.tone}"></span><div><b>${esc(c.course_code)}</b><div style="font-size:10px;color:var(--ink-soft)">${esc(c.title)}</div></div></div><span class="badge ${h.status}">${esc(h.label)}</span></div>`;
-  }
-  function workflowStage(s,i){
-    const complete=s.tasks.every(t=>t.status==='completed'), any=s.tasks.some(t=>['in_progress','submitted','overdue'].includes(t.status));
-    return `<div class="wf-stage"><div class="wf-icon ${complete?'done':any?'now':''}">${String(i+1).padStart(2,'0')}</div><div class="wf-content"><div class="wf-title">${esc(s.stage)}</div><div class="wf-people">${s.tasks.map(t=>`<span class="person-pill"><div><b>${esc(t.short)}</b><br>${esc(facultyName(t.assignee_id))}</div>${statusBadge(t.status)}</span>`).join('')}</div></div></div>`;
-  }
-  function adminRow(c){
-    const a=assignmentFor(c.id);
-    return `<tr><td><b>${esc(c.course_code)}</b><br><span style="color:var(--ink-soft)">${esc(c.title)}</span><br>${typeBadge(c)} ${statusBadge(c.status==='published'?'completed':'waiting')}</td><td>${esc(facultyName(a.preparer_a))}</td><td>${esc(facultyName(a.preparer_b))}</td><td>${esc(facultyName(a.moderator_1))}</td><td>${esc(facultyName(a.moderator_2))}</td><td>${esc(facultyName(a.scrutinizer))}</td><td><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn small" data-edit-course="${esc(c.id)}">Edit</button><button class="btn small ${c.status==='published'?'danger':'accent'}" data-publish-course="${esc(c.id)}">${c.status==='published'?'Unpublish':'Publish'}</button></div></td></tr>`;
-  }
-  function sectionsFor(courseId){
-    const sections=state.courseSections.filter(s=>s.course_id===courseId).map(s=>s.section_code).filter(Boolean);
-    if(sections.length) return [...new Set(sections)];
-    const c=courseById(courseId);
-    if(isSessionalCourse(c)) return [c.section_a || 'A1', c.section_b || 'A2'].filter(Boolean);
-    return [c.section_a || 'X'].filter(Boolean);
-  }
-
-  function courseProgress(c){
-    if(isTheoryCourse(c)) return progressPct(TASKS.map(t=>({status:statusFor(c,t.key)})));
-    const items=[...labSessionsFor(c.id),...labItemsFor(c.id)];
-    return progressPct(items);
-  }
-  function courseHealth(c){
-    const events=eventsForAll().filter(e=>e.courseId===c.id);
-    const config=labConfigFor(c.id);
-    if(isSessionalCourse(c) && (config.config_status || 'setup_required') !== 'configured') return {label:'Attention', status:'waiting', tone:'yellow'};
-    if(events.some(e=>e.date < todayIso() && !['completed','conducted','marks_published','marks_uploaded','shared_with_students','uploaded','cancelled'].includes(e.status))) return {label:'At Risk', status:'overdue', tone:'red'};
-    if(courseProgress(c)===100) return {label:'Completed', status:'completed', tone:'done'};
-    if(events.some(e=>daysFromToday(e.date)>=0 && daysFromToday(e.date)<=3 && !['completed','conducted','marks_published','marks_uploaded','shared_with_students','uploaded','cancelled'].includes(e.status))) return {label:'Attention', status:'waiting', tone:'yellow'};
-    return {label:'On Track', status:'in_progress', tone:'green'};
-  }
-  function setupWarnings(){
-    const warnings=[];
-    for(const type of ['COURSE_OUTLINE_SHARING','QUESTION_SUBMISSION_DEADLINE','FEEDBACK_DEADLINE','CAR_DEADLINE']){
-      if(!milestoneDate(type)) warnings.push({title:`${milestoneLabel(type)} not configured`,detail:'This should be a term-level milestone, not repeated manually for every course.'});
-    }
-    for(const c of state.courses){
-      if(!sectionsFor(c.id).length) warnings.push({title:`${c.course_code}: sections missing`,detail:'Theory normally uses X; sessional courses commonly use A1/A2; thesis may also use X.'});
-      const outline=state.courseOutlines.find(o=>o.course_id===c.id);
-      if(!outline || outline.status!=='shared_with_students') warnings.push({title:`${c.course_code}: course outline not shared`,detail:`Current status: ${OUTLINE_STATUS_LABEL[outline?.status || 'not_started']}.`});
-      if(isSessionalCourse(c) && (sessionalConfigFor(c.id).config_status || 'setup_required') !== 'configured') warnings.push({title:`${c.course_code}: sessional assessment structure not configured`,detail:'Configure components, quantities, scope, and session count before full tracking.'});
-    }
-    for(const ct of state.classTests){
-      if((ct.status && ct.status!=='not_planned') && !ctDate(ct)) warnings.push({title:`${courseById(ct.course_id).course_code || ''}: ${ct.title || `CT ${ct.ct_number || ''}`} has status but no date`,detail:'Migrated CT records may be incomplete, but they should remain visible for cleanup.'});
-    }
-    for(const i of (state.assessmentInstances.length ? state.assessmentInstances : state.labAssessmentItems)){
-      if((i.due_date || i.scheduled_date) && !i.title) warnings.push({title:`${courseById(i.course_id).course_code || ''}: assessment date exists without type`,detail:'Do not silently discard partially-filled workbook triplets.'});
-      if(i.title && !i.due_date && !i.scheduled_date) warnings.push({title:`${courseById(i.course_id).course_code || ''}: ${i.title} has incomplete scheduling`,detail:'Assessment type exists but scheduling details are incomplete.'});
-    }
-    return warnings;
-  }
-  function attentionItems(){
-    const items=[];
-    for(const o of state.courseOutlines.filter(o=>o.status!=='shared_with_students')){
-      const c=courseById(o.course_id), date=o.due_date || milestoneDate('COURSE_OUTLINE_SHARING');
-      if(courseIsMine(c) && daysFromToday(date)<=10) items.push({kind:'Course Outline', title:`${c.course_code || ''} - Course outline`, detail:OUTLINE_STATUS_LABEL[o.status || 'not_started'], date, week:weekForDate(date), status:o.status || 'not_started', courseId:o.course_id, rank:daysFromToday(date)<0?0:2});
-    }
-    for(const t of myTheoryTasks()){
-      if(t.status==='completed') continue;
-      if(t.status==='overdue' || (t.due_date && daysFromToday(t.due_date)<=7)) items.push({kind:'Theory', title:`${t.course.course_code} - ${t.label}`, detail:t.status==='waiting'?'Waiting for prerequisite completion.':`Responsible: ${facultyName(t.assignee_id)}`, date:t.due_date, week:weekForDate(t.due_date), status:t.status, courseId:t.course.id, rank:t.status==='overdue'?0:2});
-    }
-    for(const ct of myClassTests().filter(ct=>!['completed','marks_published','cancelled'].includes(ct.status))){
-      const date=ctDate(ct);
-      if(!date || daysFromToday(date)<=10) items.push({kind:'Class Test', title:`${courseById(ct.course_id).course_code || ''} - ${ct.title || `CT ${ct.ct_number || ''}`}`, detail:date ? `${ct.section || 'All'} | ${ct.syllabus || 'Syllabus not set'}` : 'CT status exists but no CT date has been recorded.', date, week:weekForDate(date), status:ct.status || 'not_planned', courseId:ct.course_id, rank:!date?0:daysFromToday(date)<0?0:1});
-    }
-    for(const i of [...myLabSessions(),...myLabItems()].filter(x=>!['completed','cancelled'].includes(x.status))){
-      const date=i.date || i.due_date || i.scheduled_date;
-      if(daysFromToday(date)<=10) items.push({kind:'Sessional', title:`${courseById(i.course_id).course_code || ''} - ${'session_no' in i ? `Session ${i.session_no}` : i.title}`, detail:'assigned_faculty' in i ? i.title : `${i.marks || i.marks_each || 0} marks`, date, week:weekForDate(date), status:i.status, courseId:i.course_id, rank:daysFromToday(date)<0?0:2});
-    }
-    for(const f of state.feedbackStatuses.filter(f=>f.status!=='completed')){
-      const c=courseById(f.course_id), date=f.deadline || milestoneDate('FEEDBACK_DEADLINE');
-      if(courseIsMine(c) && daysFromToday(date)<=10) items.push({kind:'Feedback', title:`${c.course_code || ''} - Student feedback`, detail:f.notes || 'Feedback workflow not complete.', date, week:weekForDate(date), status:f.status || 'not_started', courseId:f.course_id, rank:daysFromToday(date)<0?0:3});
-    }
-    for(const cf of state.courseFileStatuses.filter(cf=>!['uploaded','completed'].includes(cf.status))){
-      const c=courseById(cf.course_id), date=cf.deadline || milestoneDate('CAR_DEADLINE');
-      if(courseIsMine(c) && daysFromToday(date)<=10) items.push({kind:'Course File / CAR', title:`${c.course_code || ''} - Course File / CAR`, detail:cf.notes || 'Course archive not complete.', date, week:weekForDate(date), status:cf.status || 'not_started', courseId:cf.course_id, rank:daysFromToday(date)<0?0:3});
-    }
-    return items.sort((a,b)=>a.rank-b.rank || (a.date || '').localeCompare(b.date || ''));
-  }
-  function recentChanges(){
-    const changes=state.classTestHistory.map(h=>{
-      const ct=byId(state.classTests,h.class_test_id) || {}, c=courseById(ct.course_id);
-      return {kind:'CT Change', title:`${c.course_code || ''} ${ct.title || ''}`, detail:`Moved from ${fmtDate(h.old_date)} ${h.old_time || ''} to ${fmtDate(h.new_date)} ${h.new_time || ''}. ${h.reason || ''}`, level:'in_progress'};
+  function close(){if(busy)return;$('#dialog').close();priorFocus?.focus();}
+  function field(label,name,value='',type='text',attrs=''){return `<label class="field"><span>${esc(label)}</span><input type="${type}" name="${name}" value="${esc(value)}" ${attrs}></label>`;}
+  function select(label,name,items,value=''){return `<label class="field"><span>${esc(label)}</span><select name="${name}">${options(items,value)}</select></label>`;}
+  function formEnd(label='Save changes'){return `<div id="form-error" class="form-error" role="alert"></div><div class="form-actions"><span class="small muted">${store.demo?'Preview · changes are not persisted':'Saved securely to your workspace'}</span><button class="button primary" type="submit">${label} ${icon('arrow')}</button></div></form>`;}
+  function wireSave(handler){$('#editor').onsubmit=async e=>{e.preventDefault();if(busy)return;busy=true;const form=e.currentTarget,btn=form.querySelector('[type=submit]'),old=btn.innerHTML;btn.disabled=true;btn.textContent='Saving…';$('#form-error').textContent='';try{await handler(new FormData(form));busy=false;close();render();notice(store.demo?'Updated in this preview':'Saved');}catch(err){busy=false;$('#form-error').textContent=err.saved?'Saved, but refresh failed. Close and refresh before editing again.':err.message;btn.disabled=!!err.saved;btn.innerHTML=old;}};}
+  function editActivity(a){
+    if(!a)return;const manages=W.manages(data(),a.course.id,store.profile),owns=a.owner===fid()||admin(),editable=(owns||manages)&&a.course.status!=='archived'&&(data().term.active||store.demo),r=a.row;
+    const dates={ct:[['Scheduled date','scheduled_date'],['Marking deadline','marking_due_date'],['Publication deadline','publication_due_date']],session:[['Session date','date'],['Report deadline','report_deadline']],assessment:[['Scheduled date','scheduled_date'],['Upload deadline','due_date']],outline:[['Sharing deadline','due_date']],feedback:[['Deadline','deadline']],car:[['Deadline','deadline']],grade:[['Deadline','due_date']]};
+    modal(a.title,`<div class="activity-context"><span>${esc(a.course.course_code)} · ${esc(r.section||r.scope||W.LABELS[a.kind])}</span><strong>${esc(name(a.owner))}</strong></div>${a.waiting.length?`<div class="callout">${icon('clock')}<span>Waiting for ${esc(a.waiting.map(x=>x?.title||'prerequisite').join(', '))}.</span></div>`:''}${!editable?'<p class="callout">You can view this activity. Updates belong to its assigned owner.</p>':''}<form id="editor"><fieldset ${editable?'':'disabled'}>${owns?select('Status','status',W.STATES[a.kind],a.status):`<p>${badge(a.status,a.kind)}</p>`}<div class="form-grid">${(dates[a.kind]||[]).map(([l,k])=>field(l,k,r[k]||'','date',manages||a.kind==='ct'&&k==='scheduled_date'||a.kind==='session'&&k==='date'?'':'disabled')).join('')}${a.kind==='ct'?field('Start time','scheduled_time',r.scheduled_time||r.time||'','time')+field('Duration (minutes)','duration_minutes',r.duration_minutes||30,'number','min="1" max="480"'):''}</div>${manages?select('Accountable owner',a.kind==='session'?'assigned_faculty':'responsible_faculty',[['','Unassigned'],...data().faculty.filter(f=>data().courseFaculty.some(cf=>cf.course_id===a.course.id&&cf.faculty_id===f.id)).map(f=>[f.id,f.full_name])],a.owner):''}${owns?`${field('Evidence link (HTTPS)','evidence_url',r.evidence_url||'','url','placeholder="https://…"')}<label class="field"><span>Notes / blocker</span><textarea name="notes" rows="3" placeholder="What changed, or what’s getting in the way?">${esc(r.notes||'')}</textarea></label>`:''}<label class="field"><span>Reason for correction or schedule change</span><textarea name="change_reason" rows="2" placeholder="Required for rescheduling, reopening, or administrative corrections"></textarea></label></fieldset><div class="activity-meta">Last changed: ${r.updated_at?esc(new Date(r.updated_at).toLocaleString()):'No recorded change'}</div>${editable?formEnd():'</form>'}${owns&&a.course.status!=='archived'?'<button class="text-button request-link" id="request-change">Request an extension or reassignment '+icon('arrow')+'</button>':''}`);
+    if(editable)wireSave(async fd=>{const patch=Object.fromEntries(fd);if(!['ct','session','assessment','outline','feedback','car'].includes(a.kind))delete patch.responsible_faculty;if(!manages){delete patch.responsible_faculty;delete patch.assigned_faculty;}
+      for(const k of Object.keys(patch)){if(k.endsWith('_date')||['date','deadline','due_date','report_deadline','scheduled_time','responsible_faculty','assigned_faculty'].includes(k))patch[k]=patch[k]||null;}
+      if(patch.duration_minutes)patch.duration_minutes=+patch.duration_minutes;await store.save(a,patch);
     });
-    state.notifications.filter(n=>!n.read_at && (!n.faculty_id || n.faculty_id===profileFacultyId())).forEach(n=>changes.push({kind:'Notification', title:n.title, detail:n.body, level:n.level==='warning'?'waiting':'in_progress'}));
-    return changes;
+    if($('#request-change'))$('#request-change').onclick=()=>requestForm(a);
   }
-  function notificationItems(){
-    const items=attentionItems().slice(0,8).map(i=>({level:i.status,title:i.title,detail:i.detail,courseId:i.courseId,rank:i.rank}));
-    state.notifications.filter(n=>!n.read_at && (!n.faculty_id || n.faculty_id===profileFacultyId())).forEach(n=>items.push({level:n.level==='warning'?'waiting':'in_progress',title:n.title,detail:n.body,courseId:null,rank:1}));
-    return items.sort((a,b)=>(a.rank||0)-(b.rank||0));
+  function requestForm(a){modal('Ask for a change',`<p class="muted">${esc(a.course.course_code)} · ${esc(a.title)}</p><form id="editor">${select('Request type','request_type',['extension','reassignment'],'extension')}${field('Proposed deadline (for an extension)','proposed_date','','date')}<label class="field"><span>Reason</span><textarea name="reason" required rows="4"></textarea></label>${formEnd('Submit request')}`);wireSave(async fd=>{if(store.demo){data().requests.push({id:crypto.randomUUID(),reason:fd.get('reason'),request_type:fd.get('request_type'),status:'pending'});return;}await store.mutate('workflow_request',{p_course:a.course.id,p_kind:a.kind,p_id:a.row.id||null,p_task:a.key,p_type:fd.get('request_type'),p_reason:fd.get('reason'),p_date:fd.get('proposed_date')||null});});}
+  function courseForm(c={}){
+    const a=data().primaryAssignments.find(a=>a.course_id===c.id)||data().sessionalGradeAssignments.find(a=>a.course_id===c.id)||{},members=data().courseFaculty.filter(r=>r.course_id===c.id),fs=[['','Unassigned'],...data().faculty.map(f=>[f.id,f.full_name])];
+    modal(c.id?'Course settings':'A new course offering',`<form id="editor"><div class="form-grid">${field('Course code','course_code',c.course_code||'','text',c.id?'readonly':'required')}${select('Course type','course_type',['theory','sessional'],c.course_type||'theory')}${field('Course title','title',c.title||'','text','required')}${field('Cohort / batch','batch',c.batch||'')}</div><p class="mini-label">COURSE TEAM</p><div class="teacher-options">${data().faculty.map(f=>`<label><input type="checkbox" name="teachers" value="${esc(f.id)}" ${members.some(r=>r.faculty_id===f.id)?'checked':''}>${esc(f.full_name)}</label>`).join('')}</div>${select('Course coordinator','coordinator',fs,members.find(r=>['coordinator','sessional_coordinator'].includes(r.role))?.faculty_id||'')}<div class="form-grid">${[['preparer_a','Question preparer · A'],['preparer_b','Question preparer · B'],['moderator_1','Moderator · 01'],['moderator_2','Moderator · 02'],['scrutinizer','Scrutinizer'],['preparer','Sessional gradesheet preparer']].map(([k,l])=>select(l,k,fs,a[k]||'')).join('')}${field('Question deadline','question_deadline',c.question_deadline||'','date')}${field('Exam date','exam_date',c.exam_date||'','date')}${field('Final gradesheet deadline','final_gradesheet_deadline',c.final_gradesheet_deadline||'','date')}</div>${select('Publication','status',['draft','published','archived'],c.status||'draft')}<label class="field"><span>Reason for changes to an existing offering</span><textarea name="change_reason"></textarea></label>${formEnd()}`);
+    wireSave(async fd=>{if(store.demo)throw Error('Course setup needs a connected workspace. Activity updates can be explored in the preview.');const p=Object.fromEntries(fd),assign=Object.fromEntries(['preparer_a','preparer_b','moderator_1','moderator_2','scrutinizer','preparer'].map(k=>[k,p[k]||null]));await store.mutate('workflow_course',{p_id:c.id||null,p_term:data().term.id,p_patch:{course_code:p.course_code,title:p.title,course_type:p.course_type,batch:p.batch,status:p.status,question_deadline:p.question_deadline,exam_date:p.exam_date,final_gradesheet_deadline:p.final_gradesheet_deadline,coordinator:p.coordinator,change_reason:p.change_reason,expected_revision:c.revision??null},p_teachers:fd.getAll('teachers'),p_assignments:assign});});
   }
-  function findCtConflicts(){
-    const seen={}, conflicts=[];
-    for(const ct of state.classTests.filter(x=>!['cancelled','postponed'].includes(x.status))){
-      const key=[ct.batch || courseById(ct.course_id).batch || '',ct.section || '',ctDate(ct) || '',ctTime(ct)].join('|');
-      if(seen[key] && ctDate(ct)) conflicts.push({title:`${ct.batch || ''} Section ${ct.section || 'All'} has overlapping CTs`,detail:`${courseById(seen[key].course_id).course_code || ''} ${seen[key].title} and ${courseById(ct.course_id).course_code || ''} ${ct.title} share ${fmtDate(ctDate(ct))} ${ctTime(ct)}.`});
-      else seen[key]=ct;
+  function facultyForm(f={}){const a=(data().allowed||[]).find(a=>a.faculty_id===f.id)||{};modal('Faculty access',`<form id="editor">${field('Full name','name',f.full_name||'','text','required')}${field('Approved email','email',a.email||f.email||'','email','required')}${select('Department role','role',['faculty','admin','hod'],a.app_role||'faculty')}${select('Access','active',[['true','Approved'],['false','Revoked']],String(a.active??true))}<p class="small muted">The faculty member verifies this exact email before academic records become available. Changing it revokes the previous mapping.</p>${formEnd()}`);wireSave(async fd=>{if(store.demo)throw Error('Faculty approvals require a connected workspace.');await store.mutate('workflow_faculty',{p_id:f.id||null,p_name:fd.get('name'),p_email:fd.get('email'),p_role:fd.get('role'),p_active:fd.get('active')==='true'});});}
+  function termForm(){const t=data().term;modal('Term & academic calendar',`<form id="editor">${field('Term name','name',t.name,'text','required')}<div class="form-grid">${field('Total teaching weeks','total_teaching_weeks',t.total_teaching_weeks,'number','min="1" max="52" required')}${field('Completed teaching weeks','latest_completed_week',t.latest_completed_week,'number','min="0" max="52" required')}</div>${select('Academic progression','calendar_status',['active','paused'],t.calendar_status)}${field('Reason / calendar note','pause_reason',t.pause_reason||'','text','required')}<p class="small muted">Calendar progression never completes academic work. Week ranges can include teaching breaks.</p><div class="week-editor">${Array.from({length:t.total_teaching_weeks},(_,i)=>{const w=data().academicWeeks.find(w=>w.week_no===i+1)||{};return `<div><span>Week ${i+1}</span>${field('Starts','start_'+(i+1),w.starts_on||'','date')}${field('Ends','end_'+(i+1),w.ends_on||'','date')}</div>`;}).join('')}</div>${formEnd()}</form><button class="text-button" id="new-term">Start a new term →</button>`);wireSave(async fd=>{if(store.demo)throw Error('Calendar settings require a connected workspace.');const p=Object.fromEntries(fd);p.total_teaching_weeks=+p.total_teaching_weeks;p.latest_completed_week=+p.latest_completed_week;p.weeks=Array.from({length:p.total_teaching_weeks},(_,i)=>({week_no:i+1,starts_on:p['start_'+(i+1)]||null,ends_on:p['end_'+(i+1)]||null}));await store.mutate('workflow_term',{p_id:t.id,p_patch:p});});$('#new-term').onclick=()=>{modal('Start a new term',`<form id="editor">${field('Term name','name','','text','required')}${field('Stable term code','code','','text','required placeholder="2027-01"')}<p class="muted small">Creates an inactive term. Old offerings and completed work remain intact. Add new course offerings from Manage.</p>${formEnd('Create term')}`);wireSave(async fd=>{if(store.demo)throw Error('Term creation requires a connected workspace.');await store.mutate('workflow_term',{p_id:null,p_patch:Object.fromEntries(fd)});});};}
+  function newCt(){const c=data().courses.find(c=>c.id===courseId);modal('Plan a class test',`<form id="editor"><div class="form-grid">${field('CT number','ct_number',1,'number','min="1" required')}${field('Title','title','Class test','text','required')}${field('Teaching section','section','Entire Course')}${field('Cohort / batch','batch',c.batch||'','text','required')}${field('Scheduled date','scheduled_date','','date')}${field('Start time','scheduled_time','','time')}${field('Duration (minutes)','duration_minutes',30,'number','min="1" max="480" required')}${field('Marking deadline','marking_due_date','','date')}${field('Publication deadline','publication_due_date','','date')}</div>${select('Accountable owner','responsible_faculty',[['','Unassigned'],...data().faculty.filter(f=>data().courseFaculty.some(cf=>cf.course_id===c.id&&cf.faculty_id===f.id)).map(f=>[f.id,f.full_name])])}${formEnd('Create class test')}`);wireSave(async fd=>{const p=Object.fromEntries(fd);p.ct_number=+p.ct_number;p.duration_minutes=+p.duration_minutes;for(const k of Object.keys(p))if(!p[k])p[k]=null;p.status=p.scheduled_date?'scheduled':'not_planned';if(store.demo){data().classTests.push({...p,id:crypto.randomUUID(),course_id:c.id,revision:1});return;}await store.mutate('workflow_save_activity',{p_kind:'ct',p_course:c.id,p_patch:p});});}
+  function generate(){const c=data().courses.find(c=>c.id===courseId);modal('Configure sessional activities',`<form id="editor">${select('Activity group','kind',[['sessions','Teaching sessions'],['component','Assessment component']])}${field('Component name','name','Report','text','required')}<div class="form-grid">${field('Quantity','quantity',1,'number','min="1" max="100" required')}${field('Counted quantity','counted_quantity',1,'number','min="0" max="100" required')}${field('Marks per assessment','marks_each',0,'number','min="0" step="0.01" required')}${field('Teaching section / scope','scope','Entire Course','text','required')}</div>${select('Owner','owner',[['','Unassigned'],...data().faculty.filter(f=>data().courseFaculty.some(cf=>cf.course_id===c.id&&cf.faculty_id===f.id)).map(f=>[f.id,f.full_name])])}<p class="small muted">Existing sequences keep their IDs and progress. Cancel surplus sessions explicitly before reducing the count.</p>${formEnd('Generate activities')}`);wireSave(async fd=>{if(store.demo)throw Error('Activity generation requires a connected workspace.');const p=Object.fromEntries(fd);await store.mutate('workflow_generate',{p_course:c.id,p_kind:p.kind,p_payload:p});});}
+  function importForm(){importRows=null;modal('Review a CT import',`<p class="muted">Choose a CT tracker CSV. Review every change before applying it. Faculty ownership is never inferred from column order.</p><label class="upload-zone">${icon('upload')}<strong>Choose a CSV file</strong><span>Private preview · nothing changes yet</span><input id="import-file" type="file" accept=".csv,text/csv"></label><div id="import-preview"></div>`);$('#import-file').onchange=async e=>{try{const file=e.target.files[0];if(!file)return;const text=await file.text();importFingerprint=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(text)))).map(x=>x.toString(16).padStart(2,'0')).join('');importRows=W.previewCT(text,data());$('#import-preview').innerHTML=`<p>${importRows.length} populated CTs · ${importRows.filter(r=>r.errors.length).length} blocked · ${importRows.filter(r=>r.action==='changed').length} conflicts to review</p><div class="import-table"><table><thead><tr><th>Select</th><th>Course / CT</th><th>Existing → proposed</th><th>Review notes</th></tr></thead><tbody>${importRows.map((r,i)=>`<tr><td><input type="checkbox" data-import-row="${i}" aria-label="Apply ${esc(r.course_code)} CT ${r.ct_number}" ${r.errors.length||r.action==='unchanged'?'disabled':''}></td><td>${esc(r.course_code)}<br>CT ${r.ct_number}</td><td>${esc(r.old?.status||'New')} → ${esc(r.status)}<br>${fmt(r.old?.scheduled_date)} → ${fmt(r.scheduled_date)}</td><td>${esc([...r.errors,...r.warnings].join(' · ')||r.action)}</td></tr>`).join('')}</tbody></table></div><label class="field"><span>Reason / reconciliation note</span><input id="import-reason" required placeholder="Why is this source authoritative?"></label><button id="apply-import" class="button primary">Apply selected changes</button><p id="import-error" role="alert"></p>`;$('#apply-import').onclick=applyImport;}catch(err){$('#import-preview').textContent=err.message;}};}
+  async function applyImport(){const btn=$('#apply-import');if(btn.disabled)return;btn.disabled=true;try{const rows=[...document.querySelectorAll('[data-import-row]:checked')].map(el=>importRows[+el.dataset.importRow]);if(!rows.length)throw Error('Select the reviewed changes to apply.');if(!$('#import-reason').value.trim())throw Error('Add a reconciliation reason.');if(store.demo)throw Error('The preview is available here; applying an import requires a connected workspace.');await store.mutate('workflow_import_ct',{p_term:data().term.id,p_fingerprint:importFingerprint,p_rows:rows.map(r=>({...r,expected_revision:r.old?.revision??null,id:r.old?.id||null,old:undefined})),p_reason:$('#import-reason').value});close();render();notice('Reviewed changes imported. Existing history was preserved.');}catch(e){$('#import-error').textContent=e.message;btn.disabled=false;}}
+  async function action(key,attrs={}){
+    if(key==='my-work'){view='tasks';render();}else if(key==='refresh')await refresh();else if(key==='new-course')courseForm();else if(key==='edit-course')courseForm(data().courses.find(c=>c.id===courseId));else if(key==='new-faculty')facultyForm();else if(key==='term')termForm();else if(key==='import')importForm();else if(key==='new-ct')newCt();else if(key==='generate')generate();else if(['prev-month','next-month','this-month'].includes(key)){calendarOffset=key==='this-month'?0:calendarOffset+(key==='prev-month'?-1:1);render();}else if(key==='account'){modal('Your workspace',`<p>${esc(name(fid()))}</p><p class="muted">${esc(W.text(store.profile.app_role))} · ${store.demo?'Fictional preview identity':'Verified faculty identity'}</p><button id="sign-out" class="button secondary">${icon('logout')} ${store.demo?'Exit preview':'Sign out'}</button>`);$('#sign-out').onclick=async()=>{if(!store.demo)await store.client.auth.signOut();location.href=location.pathname;};}else if(key==='read-notice'){try{if(store.demo)data().receipts.push({notification_id:attrs.id});else await store.query(store.client.from('notification_receipts').upsert({notification_id:attrs.id,user_id:store.profile.user_id},{onConflict:'notification_id,user_id',ignoreDuplicates:true}),'Mark read');await refresh();}catch(e){notice(e.message,'error');}}else if(key==='resolve-request'){const r=data().requests.find(r=>r.id===attrs.id);modal('Review request',`<p>${esc(r.reason)}</p><form id="editor">${select('Decision','decision',['approved','declined'])}${field('Approved deadline','date',r.proposed_date||'','date')}${select('New owner (reassignment)','owner',[['','Select faculty'],...data().faculty.map(f=>[f.id,f.full_name])])}${field('Decision reason','reason','','text','required')}${formEnd('Record decision')}`);wireSave(async fd=>{if(store.demo){r.status=fd.get('decision');r.resolution=fd.get('reason');return;}await store.mutate('workflow_resolve_request',{p_id:r.id,p_decision:fd.get('decision'),p_reason:fd.get('reason'),p_date:fd.get('date')||null,p_owner:fd.get('owner')||null});});}
+  }
+  function landing(mode='locked',message=''){
+    $('#app').innerHTML=`<header class="landing-nav"><a class="wordmark" href="${esc(location.pathname)}"><span class="brand-symbol"><i></i><i></i><i></i></span>BME<span class="wordmark-light">Workflow</span></a><span>Biomedical Engineering · BUET</span></header><main class="landing"><p class="eyebrow">LESS ADMIN. MORE POSSIBILITY.</p><h1>Great work.<br><span>Beautifully in sync.</span></h1><p class="landing-description">A considered space for your academic day.<br>Every responsibility. Every next step. Together.</p>${mode==='auth'?`<form id="login" class="signin-card"><label class="field"><span>Your approved faculty email</span><input type="email" name="email" autocomplete="email" placeholder="you@university.edu" required></label><button class="button primary" type="submit">Email me a sign-in link ${icon('arrow')}</button><p class="small muted">Verify your email to enter your assigned workspace.</p><p id="auth-message" role="status">${esc(message)}</p></form>`:mode==='pending'?`<div class="signin-card"><h2>Awaiting approval</h2><p>Your email is verified. An administrator needs to link it to your faculty identity.</p><button id="retry-access" class="button primary">Check access again</button><button id="pending-signout" class="text-button">Sign out</button></div>`:mode==='error'?`<div class="signin-card"><h2>We couldn’t load your workspace</h2><p class="form-error">${esc(message)}</p><button id="retry-access" class="button primary">Try again</button></div>`:`<div class="landing-actions"><a class="button primary" href="?demo=1">Explore the workspace ${icon('arrow')}</a><span>Interactive preview · fictional data</span></div>`}<div class="landing-preview"><div class="preview-top"><span class="preview-dot"></span><span class="preview-dot"></span><span class="preview-dot"></span><span>Your day, thoughtfully organized</span></div><div class="preview-content"><div><p class="eyebrow">A CLEARER PICTURE</p><h2>Everything in its place.<br>You, in your element.</h2><p>From the first class to the final course file.<br>A shared rhythm for your department.</p></div><div class="preview-cards"><div>${icon('tasks')}<span>Needs my action<small>A clear next step</small></span><b>03</b></div><div>${icon('calendar')}<span>Coming up<small>A little room to plan</small></span><b>07</b></div><div>${icon('check')}<span>Completed<small>Progress worth seeing</small></span><b>12</b></div></div></div></div><p class="landing-footnote">Built around people. Protected by verified access.</p>${mode==='locked'?'<p class="setup-note">This workspace is awaiting its secure backend connection. The preview is ready to explore.</p>':''}</main>`;
+    if($('#login'))$('#login').onsubmit=async e=>{e.preventDefault();const btn=e.currentTarget.querySelector('button');btn.disabled=true;btn.textContent='Sending link…';try{const {error}=await store.client.auth.signInWithOtp({email:new FormData(e.currentTarget).get('email').trim(),options:{emailRedirectTo:location.origin+location.pathname}});if(error)throw error;$('#auth-message').textContent='Check your inbox for your sign-in link.';}catch(err){$('#auth-message').textContent=err.message;}finally{btn.disabled=false;btn.textContent='Email me a sign-in link';}};
+    if($('#retry-access'))$('#retry-access').onclick=()=>bootstrap();if($('#pending-signout'))$('#pending-signout').onclick=()=>store.client.auth.signOut();
+  }
+  async function bootstrap(){
+    try{
+      const {data:{session},error}=await store.client.auth.getSession();if(error)throw error;if(!session){landing('auth');return;}
+      const approved=await store.query(store.client.rpc('claim_allowed_profile'),'Account verification');if(!approved){landing('pending');return;}
+      store.profile=await store.query(store.client.from('profiles').select('*').eq('user_id',session.user.id).single(),'Profile');
+      const migrations=await store.query(store.client.from('workflow_migrations').select('version').eq('version','202609170002'),'Database compatibility');
+      if(!migrations.length)throw Error('The database upgrade is pending. Apply the numbered workflow migrations before using this release.');
+      await store.load();render();
+    }catch(e){landing('error',e.message);}
+  }
+  async function init(){
+    $('#dialog-close').onclick=close;$('#dialog').addEventListener('cancel',e=>{if(busy)e.preventDefault();});$('#dialog').addEventListener('click',e=>{if(e.target===$('#dialog'))close();});
+    if(new URLSearchParams(location.search).get('demo')==='1'&&cfg.mode!=='production'){
+      await new Promise((resolve,reject)=>{const s=document.createElement('script');s.src='./demo-data.js';s.onload=resolve;s.onerror=reject;document.head.append(s);});store.data=structuredClone(window.EXAMFLOW_DEMO);Object.assign(store.data,{deadlines:[],requests:[],receipts:[],audit:[],allowed:[],outbox:[]});store.profile={user_id:'demo',faculty_id:'f3',active:true,app_role:'admin'};for(const c of store.data.courses)c.term_id=store.data.term.id;render();return;
     }
-    return conflicts;
+    if(cfg.mode!=='production'||!cfg.supabaseUrl||!cfg.supabaseAnonKey){landing();return;}
+    if(!window.supabase){landing('error','The sign-in library could not load. Check your connection and reload.');return;}
+    store=new window.WorkflowStore.Store(window.supabase.createClient(cfg.supabaseUrl,cfg.supabaseAnonKey));
+    let currentUser=null;store.client.auth.onAuthStateChange((event,session)=>{if(event==='SIGNED_OUT'){currentUser=null;store.data={};store.profile=null;landing('auth');}else if(event==='SIGNED_IN'&&session?.user.id!==currentUser){currentUser=session.user.id;setTimeout(bootstrap,0);}});
+    await bootstrap();
   }
-  function findConflicts(){
-    const errors=[],warnings=[];
-    for(const c of theoryCourses()){
-      const a=assignmentFor(c.id);const p=`${c.course_code} - ${c.title}`;
-      const missing=['preparer_a','preparer_b','moderator_1','moderator_2','scrutinizer'].filter(k=>!a[k]); if(missing.length) errors.push({title:`${p}: incomplete assignment`,detail:`Missing ${missing.join(', ')}.`});
-      if(a.preparer_a&&a.preparer_a===a.preparer_b) errors.push({title:`${p}: Section A/B preparer conflict`,detail:'Question Preparer A and Question Preparer B must be different.'});
-      if(a.moderator_1&&a.moderator_1===a.moderator_2) errors.push({title:`${p}: moderator conflict`,detail:'Moderator 01 and Moderator 02 must be different.'});
-      for(const m of ['moderator_1','moderator_2']) if(a[m]&&(a[m]===a.preparer_a||a[m]===a.preparer_b)) errors.push({title:`${p}: moderator independence conflict`,detail:`${m==='moderator_1'?'Moderator 01':'Moderator 02'} cannot also be a question preparer.`});
-      if(a.scrutinizer&&(a.scrutinizer===a.preparer_a||a.scrutinizer===a.preparer_b)) errors.push({title:`${p}: scrutiny conflict`,detail:'Script Scrutinizer cannot be either examiner/question preparer.'});
-      if(a.scrutinizer&&(a.scrutinizer===a.moderator_1||a.scrutinizer===a.moderator_2)) warnings.push({title:`${p}: moderator also scrutinizer`,detail:'This combination is permitted but is flagged for administrative awareness.'});
-      if(c.question_deadline&&c.exam_date&&c.question_deadline>c.exam_date) errors.push({title:`${p}: invalid deadline order`,detail:'Question submission deadline occurs after the exam date.'});
-      if(c.exam_date&&c.final_gradesheet_deadline&&c.exam_date>c.final_gradesheet_deadline) errors.push({title:`${p}: invalid deadline order`,detail:'Final gradesheet deadline occurs before the exam date.'});
-    }
-    for(const c of labCourses()) if((labConfigFor(c.id).config_status || 'setup_required') !== 'configured') warnings.push({title:`${c.course_code}: sessional configuration pending`,detail:'Sessional courses need session count and assessment components before full tracking.'});
-    setupWarnings().forEach(x=>warnings.push(x));
-    findCtConflicts().forEach(x=>warnings.push(x));
-    const load={};taskObjects().forEach(t=>{if(t.assignee_id)load[t.assignee_id]=(load[t.assignee_id]||0)+1;});Object.entries(load).filter(([,n])=>n>=12).forEach(([id,n])=>warnings.push({title:`High workload: ${facultyName(id)}`,detail:`${n} theory workflow responsibilities are currently assigned.`}));
-    return {errors,warnings};
-  }
-  function conflictBox(x,warn){return `<div class="conflict ${warn?'warning':''}"><strong>${warn?'Warning':'Error'} - ${esc(x.title)}</strong><p>${esc(x.detail)}</p></div>`;}
-  function prioritySort(a,b){const rank={overdue:0,confirmed:1,scheduled:1,in_progress:1,submitted:2,proposed:2,submission_pending:2,evaluation_pending:2,not_started:3,waiting:4,blocked:5,completed:9,conducted:8,cancelled:10};const r=(rank[a.status]??5)-(rank[b.status]??5);if(r)return r;return (a.due_date||a.date||'9999-12-31').localeCompare(b.due_date||b.date||'9999-12-31');}
-  function daysFromToday(d){if(!d)return 9999;const a=new Date(`${todayIso()}T00:00:00`),b=new Date(`${d}T00:00:00`);return Math.round((b.getTime()-a.getTime())/86400000);}
-  function daysBetween(a,b){return Math.round((new Date(`${b}T00:00:00`).getTime()-new Date(`${a}T00:00:00`).getTime())/86400000);}
-  function firstName(n){return n.replace(/^(Dr\.|Mr\.|Ms\.|Mrs\.|Prof\.)\s+/i,'').split(' ')[0]||'Faculty';}
-  function dayPart(){const h=Number(new Intl.DateTimeFormat('en',{hour:'2-digit',hour12:false,timeZone:'Asia/Dhaka'}).format(new Date()));return h<12?'morning':h<17?'afternoon':'evening';}
-
-  async function saveTermSettings(e){
-    e.preventDefault();
-    const fd=new FormData(e.currentTarget), total=Number(fd.get('total_teaching_weeks')), latest=Number(fd.get('latest_completed_week'));
-    if(!Number.isFinite(total) || total<1 || total>52 || latest<0 || latest>total){toast('Check the teaching week values. Latest completed week must be between 0 and total weeks.','error');return;}
-    const next={...activeTerm(), name:String(fd.get('name') || '').trim() || activeTerm().name, total_teaching_weeks:total, latest_completed_week:latest, calendar_status:String(fd.get('calendar_status') || 'active'), pause_reason:String(fd.get('pause_reason') || '').trim()};
-    if(!window.confirm('Save academic term settings? This changes the term tracker for all faculty.')) return;
-    await persistTerm(next,'Term settings saved.');
-  }
-  async function updateTermAction(action){
-    const t={...activeTerm()}, total=Number(t.total_teaching_weeks || 14);
-    if(action==='advance') t.latest_completed_week=Math.min(Number(t.latest_completed_week || 0)+1,total);
-    if(action==='previous') t.latest_completed_week=Math.max(Number(t.latest_completed_week || 0)-1,0);
-    if(action==='pause'){t.calendar_status='paused';t.pause_reason=t.pause_reason || window.prompt('Pause reason') || 'Calendar paused by admin';}
-    if(action==='resume'){t.calendar_status='active';t.pause_reason='';}
-    if(!window.confirm(`Confirm ${action.replace('_',' ')} for ${t.name}?`)) return;
-    await persistTerm(t,'Academic calendar updated.');
-  }
-  async function persistTerm(term,message){
-    if(state.demo){
-      state.term=term; state.selectedWeek=term.latest_completed_week || state.selectedWeek;
-      state.auditLogs.unshift({id:Date.now(),table_name:'academic_terms',action:'UPDATE',row_key:term.id,created_at:new Date().toISOString()});
-      toast(message,'success'); render(); return;
-    }
-    const payload={name:term.name,total_teaching_weeks:term.total_teaching_weeks,latest_completed_week:term.latest_completed_week,calendar_status:term.calendar_status,pause_reason:term.pause_reason,active:true};
-    let res;
-    if(term.id && term.id !== 'term-local') res=await state.supabase.from('academic_terms').update(payload).eq('id',term.id);
-    else res=await state.supabase.from('academic_terms').insert(payload).select().single();
-    if(res.error){toast(`${res.error.message}. Run the updated Supabase schema first if this table does not exist.`,'error');return;}
-    toast(message,'success'); await bootstrap();
-  }
-
-  async function updateStatus(courseId,key,newStatus){
-    const course=byId(state.courses,courseId); if(!course)return;
-    if(newStatus==='completed'&&!taskCanStart(courseId,key)){toast('Cannot complete this task before its prerequisite tasks are completed.','error');render();return;}
-    if(state.demo){const row=statusRow(courseId,key);if(row){row.status=newStatus;row.completed_at=newStatus==='completed'?new Date().toISOString():null;}else state.statuses.push({course_id:courseId,task_key:key,status:newStatus,completed_at:newStatus==='completed'?new Date().toISOString():null});toast('Demo status updated.','success');render();return;}
-    const payload={course_id:courseId,task_key:key,status:newStatus,completed_at:newStatus==='completed'?new Date().toISOString():null,updated_by:state.session.user.id};
-    const {error}=await state.supabase.from('task_statuses').upsert(payload,{onConflict:'course_id,task_key'});if(error){toast(error.message,'error');render();return;}toast('Task status updated.','success');await bootstrap();
-  }
-
-  async function togglePublishCourse(courseId){
-    const c=byId(state.courses,courseId); if(!c || !isAdmin()) return;
-    const next=c.status==='published'?'draft':'published';
-    if(next==='published' && isTheoryCourse(c)){
-      const a=assignmentFor(c.id);
-      const missing=['preparer_a','preparer_b','moderator_1','moderator_2','scrutinizer'].filter(k=>!a[k]);
-      if(missing.length){toast('Cannot publish: all five primary assignments are required.','error');return;}
-      const errs=validateAssignmentPayload(a,c);
-      if(errs.length){toast(`Cannot publish: ${errs[0]}`,'error');return;}
-    }
-    if(state.demo){c.status=next;toast(`Course ${next}.`,'success');render();return;}
-    const {error}=await state.supabase.from('courses').update({status:next}).eq('id',courseId);
-    if(error){toast(error.message,'error');return;}
-    toast(`Course ${next}.`,'success');await bootstrap();
-  }
-
-  function renderModal(){
-    if(state.modal?.type!=='editCourse') return;
-    const c=byId(state.courses,state.modal.courseId),a=assignmentFor(c.id);
-    const options=(selected)=>`<option value="">Select faculty</option>${state.faculty.map(f=>`<option value="${f.id}" ${selected===f.id?'selected':''}>${esc(f.full_name)}</option>`).join('')}`;
-    document.getElementById('modalRoot').innerHTML=`<div class="modal"><div class="modal-card"><div class="modal-head"><div><p class="eyebrow">Course Setup</p><h3>${esc(c.course_code)} - ${esc(c.title)}</h3></div><button class="modal-close" id="closeModal">x</button></div><form id="courseForm"><div class="form-grid"><div class="field"><label>Question Preparer A</label><select name="preparer_a" required>${options(a.preparer_a)}</select></div><div class="field"><label>Question Preparer B</label><select name="preparer_b" required>${options(a.preparer_b)}</select></div><div class="field"><label>Moderator 01</label><select name="moderator_1" required>${options(a.moderator_1)}</select></div><div class="field"><label>Moderator 02</label><select name="moderator_2" required>${options(a.moderator_2)}</select></div><div class="field"><label>Script Scrutinizer</label><select name="scrutinizer" required>${options(a.scrutinizer)}</select></div><div class="field"><label>Question Submission Deadline</label><input type="date" name="question_deadline" value="${esc(c.question_deadline||'')}"></div><div class="field"><label>Exam Date</label><input type="date" name="exam_date" value="${esc(c.exam_date||'')}"></div><div class="field"><label>Final Gradesheet Deadline</label><input type="date" name="final_gradesheet_deadline" value="${esc(c.final_gradesheet_deadline||'')}"></div><div class="span-2 notice">Derived automatically: Examiner A = QP-A, Examiner B = QP-B, Gradesheet Preparer = QP-A, Gradesheet Scrutinizer = Script Scrutinizer.</div><div class="span-2" id="formValidation"></div><div class="span-2 auth-actions"><button class="btn accent" type="submit">Validate & Save</button><button class="btn" type="button" id="cancelModal">Cancel</button></div></div></form></div></div>`;
-    document.getElementById('closeModal').onclick=closeModal;document.getElementById('cancelModal').onclick=closeModal;document.getElementById('courseForm').addEventListener('submit',saveCourseAssignment);
-  }
-  function closeModal(){state.modal=null;document.getElementById('modalRoot').innerHTML='';}
-  function validateAssignmentPayload(p,c){
-    const errs=[];
-    if(p.preparer_a===p.preparer_b)errs.push('Section A and Section B preparers must differ.');
-    if(p.moderator_1===p.moderator_2)errs.push('Moderator 01 and Moderator 02 must differ.');
-    if([p.preparer_a,p.preparer_b].includes(p.moderator_1))errs.push('Moderator 01 cannot be a question preparer.');
-    if([p.preparer_a,p.preparer_b].includes(p.moderator_2))errs.push('Moderator 02 cannot be a question preparer.');
-    if([p.preparer_a,p.preparer_b].includes(p.scrutinizer))errs.push('Script Scrutinizer cannot be a question preparer/examiner.');
-    if(c.question_deadline&&c.exam_date&&c.question_deadline>c.exam_date)errs.push('Question deadline cannot be after exam date.');
-    if(c.exam_date&&c.final_gradesheet_deadline&&c.exam_date>c.final_gradesheet_deadline)errs.push('Final gradesheet deadline cannot be before exam date.');
-    return errs;
-  }
-  async function saveCourseAssignment(e){
-    e.preventDefault();
-    const fd=new FormData(e.currentTarget);const c=byId(state.courses,state.modal.courseId);
-    const p={course_id:c.id,preparer_a:fd.get('preparer_a'),preparer_b:fd.get('preparer_b'),moderator_1:fd.get('moderator_1'),moderator_2:fd.get('moderator_2'),scrutinizer:fd.get('scrutinizer')};
-    const dates={question_deadline:fd.get('question_deadline')||null,exam_date:fd.get('exam_date')||null,final_gradesheet_deadline:fd.get('final_gradesheet_deadline')||null};
-    const errs=validateAssignmentPayload(p,{...c,...dates});const out=document.getElementById('formValidation');
-    if(errs.length){out.innerHTML=errs.map(x=>`<div class="notice error">${esc(x)}</div>`).join('');return;}
-    const previous=assignmentFor(c.id), consequences=[];
-    if(previous.preparer_a && previous.preparer_a!==p.preparer_a) consequences.push('QP-A -> Examiner A + Gradesheet Preparer');
-    if(previous.preparer_b && previous.preparer_b!==p.preparer_b) consequences.push('QP-B -> Examiner B');
-    if(previous.moderator_1 && previous.moderator_1!==p.moderator_1) consequences.push('Moderator 01');
-    if(previous.moderator_2 && previous.moderator_2!==p.moderator_2) consequences.push('Moderator 02');
-    if(previous.scrutinizer && previous.scrutinizer!==p.scrutinizer) consequences.push('Script Scrutinizer -> Gradesheet Scrutinizer');
-    if(consequences.length && !window.confirm(`This changes responsibility ownership:\n\n${consequences.join('\n')}\n\nUnfinished statuses for changed assignees will reset to Not Started. Completed work will remain completed and the change will be audited. Continue?`)) return;
-    if(state.demo){Object.assign(assignmentFor(c.id),p);Object.assign(c,dates);closeModal();toast('Demo assignment saved with conflict checks.','success');render();return;}
-    const [aRes,cRes]=await Promise.all([state.supabase.from('primary_assignments').upsert(p,{onConflict:'course_id'}),state.supabase.from('courses').update(dates).eq('id',c.id)]);
-    const err=aRes.error||cRes.error;if(err){out.innerHTML=`<div class="notice error">${esc(err.message)}</div>`;return;}closeModal();toast('Assignments updated. Derived roles changed automatically.','success');await bootstrap();
-  }
-
-  document.addEventListener('click',e=>{
-    const edit=e.target.closest('[data-edit-course]');if(edit){state.modal={type:'editCourse',courseId:edit.dataset.editCourse};renderModal();return;}
-    const pub=e.target.closest('[data-publish-course]');if(pub){togglePublishCourse(pub.dataset.publishCourse);return;}
-    if(e.target.id==='backCourse'){state.courseId=null;render();return;}
-  });
-  document.addEventListener('input',e=>{
-    if(e.target.id==='taskSearch'){const pos=e.target.selectionStart;state.search=e.target.value;render();const n=document.getElementById('taskSearch');if(n){n.focus();n.setSelectionRange(pos,pos);}}
-  });
-  document.addEventListener('change',e=>{if(e.target.id==='statusFilter'){state.statusFilter=e.target.value;render();}});
-
-  init();
+  init().catch(e=>landing('error',e.message));
 })();
